@@ -35,6 +35,7 @@ from fastapi.staticfiles import StaticFiles
 
 from admin_portal.backend.api import auth, api_keys, pricing, dashboard, model_mapping
 from admin_portal.backend.api import provider_keys, providers, routing, failover, beta_headers
+from admin_portal.backend.api import usage_stats, content_audit, content_audit_history
 from admin_portal.backend.middleware.cognito_auth import CognitoAuthMiddleware
 from admin_portal.backend.services.usage_aggregator import start_aggregator, stop_aggregator
 
@@ -54,6 +55,16 @@ async def lifespan(app: FastAPI):
     print(f"Admin Portal starting on port {ADMIN_PORT}...")
     print(f"Frontend directory: {FRONTEND_DIR}")
     print(f"Serve static files: {SERVE_STATIC}")
+
+    # Ensure MySQL schema exists (usage detail, content audit, archive history)
+    try:
+        from app.db.mysql import is_enabled as _mysql_on, init_db as _mysql_init
+
+        if _mysql_on():
+            _mysql_init()
+            print("MySQL schema ensured (admin portal)")
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Failed to ensure MySQL schema: {e}")
 
     # Start usage aggregator background task
     start_aggregator(interval_seconds=USAGE_AGGREGATION_INTERVAL)
@@ -98,6 +109,9 @@ app.include_router(providers.router, prefix=f"{API_PREFIX}/providers", tags=["Pr
 app.include_router(routing.router, prefix=f"{API_PREFIX}/routing", tags=["Routing"])
 app.include_router(failover.router, prefix=f"{API_PREFIX}/failover", tags=["Failover"])
 app.include_router(beta_headers.router, prefix=f"{API_PREFIX}/beta-headers", tags=["Beta Headers"])
+app.include_router(usage_stats.router, prefix=f"{API_PREFIX}/usage-stats", tags=["Usage Stats"])
+app.include_router(content_audit.router, prefix=f"{API_PREFIX}/content-audit", tags=["Content Audit"])
+app.include_router(content_audit_history.router, prefix=f"{API_PREFIX}/content-audit-history", tags=["Content Audit History"])
 
 
 @app.get("/health")

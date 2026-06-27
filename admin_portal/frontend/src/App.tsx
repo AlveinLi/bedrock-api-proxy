@@ -1,6 +1,6 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { MainLayout } from './components/Layout';
-import { Login, Dashboard, ApiKeys, Pricing, ModelMapping } from './pages';
+import { Login, Dashboard, ApiKeys, Pricing, ModelMapping, UsageStats, ContentAudit, ContentAuditHistory } from './pages';
 import Providers from './pages/Providers';
 import ProviderKeys from './pages/ProviderKeys';
 import RoutingConfig from './pages/RoutingConfig';
@@ -61,6 +61,9 @@ export default function App() {
       >
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/api-keys" element={<ApiKeys />} />
+        <Route path="/usage-stats" element={<UsageStats />} />
+        <Route path="/content-audit" element={<ContentAudit />} />
+        <Route path="/content-audit-history" element={<ContentAuditHistory />} />
         <Route path="/pricing" element={<Pricing />} />
         <Route path="/model-mapping" element={<ModelMapping />} />
         <Route path="/beta-headers" element={<BetaHeaders />} />

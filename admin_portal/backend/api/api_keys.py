@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.db.dynamodb import DynamoDBClient, APIKeyManager, UsageTracker, UsageStatsManager
+from admin_portal.backend.services import api_key_store
 from admin_portal.backend.schemas.api_key import (
     ApiKeyCreate,
     ApiKeyUpdate,
@@ -81,6 +82,24 @@ async def list_api_keys(
     )
 
 
+@router.post("/sync-to-dynamo")
+async def sync_keys_to_dynamo():
+    """
+    Overwrite DynamoDB with all API key records from the MySQL master store.
+
+    Useful for system initialization or to force DynamoDB back in line with
+    MySQL. Requires MySQL to be enabled.
+    """
+    api_key_manager, _, _ = get_managers()
+    result = api_key_store.sync_all_to_dynamo(api_key_manager)
+    if result.get("error"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result["error"],
+        )
+    return result
+
+
 @router.get("/{api_key}", response_model=ApiKeyResponse)
 async def get_api_key(api_key: str):
     """
@@ -133,15 +152,19 @@ async def create_api_key(request: ApiKeyCreate):
                 detail=f"Provider '{request.provider_id}' is inactive",
             )
 
-    new_key = api_key_manager.create_api_key(
+    new_key = api_key_store.create_api_key(
+        api_key_manager,
         user_id=request.user_id,
         name=request.name,
         owner_name=request.owner_name,
         role=request.role,
         monthly_budget=request.monthly_budget,
+        daily_token_limit=request.daily_token_limit,
         rate_limit=request.rate_limit,
         service_tier=request.service_tier,
         cache_ttl=request.cache_ttl,
+        routing_strategy=request.routing_strategy,
+        compression_strategy=request.compression_strategy,
         provider_id=request.provider_id,
     )
 
@@ -169,10 +192,10 @@ async def update_api_key(api_key: str, request: ApiKeyUpdate):
             detail="API key not found",
         )
 
-    # Update the key
+    # Update the key (MySQL first, then DynamoDB)
     update_data = request.model_dump(exclude_none=True)
     if update_data:
-        success = api_key_manager.update_api_key(api_key, **update_data)
+        success = api_key_store.update_api_key(api_key_manager, api_key, update_data)
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -194,9 +217,26 @@ async def update_api_key(api_key: str, request: ApiKeyUpdate):
         current_mtd = float(item.get("budget_used_mtd", 0) or 0)
 
         if new_budget > 0 and current_mtd >= new_budget:
-            # Deactivate the key for budget exceeded
-            api_key_manager.deactivate_for_budget_exceeded(api_key)
+            # Deactivate the key for budget exceeded (MySQL + DynamoDB)
+            api_key_store.set_active(
+                api_key_manager, api_key, is_active=False, reason="budget_exceeded"
+            )
             # Refresh the item to get updated status
+            item = api_key_manager.get_api_key(api_key)
+            if not item:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to retrieve API key after deactivation",
+                )
+
+    # Check if the daily token limit was lowered below today's usage
+    if request.daily_token_limit is not None and item.get("is_active", False):
+        new_daily_wan = float(request.daily_token_limit)
+        daily_used = int(item.get("daily_tokens_used", 0) or 0)
+        if new_daily_wan > 0 and daily_used >= new_daily_wan * 10000:
+            api_key_store.set_active(
+                api_key_manager, api_key, is_active=False, reason="daily_token_exceeded"
+            )
             item = api_key_manager.get_api_key(api_key)
             if not item:
                 raise HTTPException(
@@ -225,7 +265,7 @@ async def deactivate_api_key(api_key: str):
             detail="API key not found",
         )
 
-    api_key_manager.deactivate_api_key(api_key)
+    api_key_store.set_active(api_key_manager, api_key, is_active=False)
     return {"message": "API key deactivated successfully"}
 
 
@@ -247,7 +287,7 @@ async def reactivate_api_key(api_key: str):
             detail="API key not found",
         )
 
-    success = api_key_manager.reactivate_api_key(api_key)
+    success = api_key_store.set_active(api_key_manager, api_key, is_active=True)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -277,7 +317,7 @@ async def delete_api_key_permanently(api_key: str):
             detail="API key not found",
         )
 
-    success = api_key_manager.delete_api_key(api_key)
+    success = api_key_store.delete_api_key(api_key_manager, api_key)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

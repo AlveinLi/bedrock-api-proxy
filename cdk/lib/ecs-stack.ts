@@ -9,6 +9,7 @@ import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
+import * as rds from 'aws-cdk-lib/aws-rds';
 import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
 import { Construct } from 'constructs';
 import { EnvironmentConfig } from '../config/config';
@@ -34,6 +35,8 @@ export interface ECSStackProps extends cdk.StackProps {
   // Cognito (optional - for admin portal)
   cognitoUserPoolId?: string;
   cognitoClientId?: string;
+  // MySQL persistence (optional - only when config.mysqlEnabled)
+  database?: rds.DatabaseInstance;
 }
 
 export class ECSStack extends cdk.Stack {
@@ -52,6 +55,7 @@ export class ECSStack extends cdk.Stack {
     const { apiKeysTable, usageTable, modelMappingTable, usageStatsTable, modelPricingTable } = props;
     const { providerKeysTable, routingRulesTable, failoverChainsTable, smartRoutingConfigTable, providersTable, betaHeadersTable, responseContextTable } = props;
     const { cognitoUserPoolId, cognitoClientId } = props;
+    const { database } = props;
 
     // Create ECS Cluster
     this.cluster = new ecs.Cluster(this, 'Cluster', {
@@ -216,6 +220,21 @@ export class ECSStack extends cdk.Stack {
     // Grant read access to secret
     masterApiKeySecret.grantRead(taskRole);
 
+    // MySQL environment variables (plaintext config), shared by the proxy and
+    // admin portal containers. Empty when MySQL is disabled (zero footprint).
+    const mysqlEnvVars: { [key: string]: string } = (config.mysqlEnabled && database)
+      ? {
+          MYSQL_ENABLED: 'True',
+          MYSQL_HOST: database.dbInstanceEndpointAddress,
+          MYSQL_PORT: database.dbInstanceEndpointPort,
+          MYSQL_USER: config.mysqlUser,
+          MYSQL_PASSWORD: config.mysqlPassword,
+          MYSQL_DATABASE: config.mysqlDatabase,
+          APP_TIMEZONE: config.appTimezone,
+          CONTENT_AUDIT_ENABLED: config.contentAuditEnabled ? 'True' : 'False',
+        }
+      : {};
+
     // Map platform string to ECS CpuArchitecture
     const cpuArchitecture = config.platform === 'arm64'
       ? ecs.CpuArchitecture.ARM64
@@ -317,6 +336,9 @@ export class ECSStack extends cdk.Stack {
       // Bedrock Concurrency
       BEDROCK_THREAD_POOL_SIZE: config.bedrockThreadPoolSize.toString(),
       BEDROCK_SEMAPHORE_SIZE: config.bedrockSemaphoreSize.toString(),
+
+      // MySQL persistence (empty object spread when disabled)
+      ...mysqlEnvVars,
     };
 
     // Create service based on launch type
@@ -356,7 +378,8 @@ export class ECSStack extends cdk.Stack {
           responseContextTable,
         },
         cognitoUserPoolId,
-        cognitoClientId
+        cognitoClientId,
+        mysqlEnvVars
       );
     }
 
@@ -902,7 +925,8 @@ export class ECSStack extends cdk.Stack {
       responseContextTable: dynamodb.Table;
     },
     cognitoUserPoolId?: string,
-    cognitoClientId?: string
+    cognitoClientId?: string,
+    mysqlEnvVars: { [key: string]: string } = {}
   ): void {
     // Create Admin Portal Log Group
     const adminLogGroup = new logs.LogGroup(this, 'AdminPortalLogGroup', {
@@ -950,6 +974,8 @@ export class ECSStack extends cdk.Stack {
       COGNITO_REGION: config.region,
       // Static file serving
       SERVE_STATIC_FILES: 'true',
+      // MySQL persistence (empty object spread when disabled)
+      ...mysqlEnvVars,
     };
 
     // Add Admin Portal Container

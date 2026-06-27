@@ -7,3 +7,5 @@ export * from './useRouting';
 export * from './useFailover';
 export * from './useProviders';
 export * from './useBetaHeaders';
+export * from './useUsageStats';
+export * from './useContentAudit';

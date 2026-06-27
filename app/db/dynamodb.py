@@ -15,6 +15,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from app.core.config import settings
+from app.core.timezone import current_day_key, current_local_date, local_date_of
 from app.services.inference_profile_resolver import get_inference_profile_resolver
 
 
@@ -378,6 +379,7 @@ class APIKeyManager:
         owner_name: Optional[str] = None,
         role: Optional[str] = None,
         monthly_budget: Optional[float] = None,
+        daily_token_limit: Optional[float] = None,
         tpm_limit: Optional[int] = None,
         cache_ttl: Optional[str] = None,
         routing_strategy: Optional[str] = None,
@@ -426,7 +428,12 @@ class APIKeyManager:
             "budget_used_mtd": Decimal("0"),  # Month-to-date budget used (resets monthly)
             "budget_mtd_month": current_month,  # Month for MTD tracking (YYYY-MM)
             "budget_history": "{}",  # Monthly budget history as JSON string (e.g., {"2025-11": 32.11})
-            "deactivated_reason": None,  # Reason for deactivation (e.g., "budget_exceeded")
+            # Daily token limit (units of 万 / 10k tokens; 0 = unlimited).
+            # Resets at local midnight (settings.app_timezone).
+            "daily_token_limit": Decimal(str(daily_token_limit)) if daily_token_limit else Decimal("0"),
+            "daily_tokens_used": 0,  # Raw tokens consumed for the current local day
+            "daily_tokens_date": current_day_key(),  # Local day key (YYYY-MM-DD)
+            "deactivated_reason": None,  # Reason for deactivation (e.g., "budget_exceeded", "daily_token_exceeded")
             "tpm_limit": tpm_limit or 100000,
             "cache_ttl": cache_ttl,
             "routing_strategy": routing_strategy or "off",
@@ -436,6 +443,48 @@ class APIKeyManager:
 
         self.table.put_item(Item=item)
         return api_key
+
+    # Fields persisted on a DynamoDB API key item, with monetary values as Decimal.
+    _MONEY_FIELDS = {"monthly_budget", "budget_used", "budget_used_mtd", "daily_token_limit"}
+
+    def upsert_from_record(self, record: Dict[str, Any]) -> bool:
+        """
+        Write a full API key item to DynamoDB from a canonical record dict.
+
+        Used to sync the MySQL master store into DynamoDB (overwrite semantics).
+        ``record`` uses plain Python types: int epoch for created_at/updated_at,
+        float for monetary fields, dict for metadata. Monetary fields are
+        converted to ``Decimal`` for DynamoDB.
+
+        Args:
+            record: Canonical API key record (must include ``api_key``)
+
+        Returns:
+            True on success
+        """
+        api_key = record.get("api_key")
+        if not api_key:
+            return False
+
+        item: Dict[str, Any] = {}
+        for key, value in record.items():
+            if value is None:
+                item[key] = None
+                continue
+            if key in self._MONEY_FIELDS:
+                item[key] = Decimal(str(value))
+            else:
+                item[key] = value
+
+        # Ensure required defaults exist
+        item.setdefault("is_active", True)
+        item.setdefault("created_at", int(time.time()))
+        try:
+            self.table.put_item(Item=item)
+            return True
+        except ClientError as e:
+            print(f"[APIKeyManager] Error upserting key record: {e}")
+            return False
 
     def validate_api_key(self, api_key: str) -> Optional[Dict[str, Any]]:
         """
@@ -472,6 +521,18 @@ class APIKeyManager:
                     # New month has started - reactivate and reset MTD
                     self._reactivate_for_new_month(api_key, current_month)
                     # Fetch updated item
+                    response = self.table.get_item(Key={"api_key": api_key})
+                    return response.get("Item")
+
+            # Check if key was deactivated due to daily token limit exceeded
+            # and if a new local day has started - auto-reactivate it at midnight.
+            if deactivated_reason == "daily_token_exceeded":
+                tokens_date = item.get("daily_tokens_date", "")
+                current_day = current_day_key()
+
+                if tokens_date != current_day:
+                    # New local day has started - reactivate and reset daily counter
+                    self._reactivate_for_new_day(api_key, current_day)
                     response = self.table.get_item(Key={"api_key": api_key})
                     return response.get("Item")
 
@@ -532,6 +593,40 @@ class APIKeyManager:
             print(f"[APIKeyManager] Error reactivating key: {e}")
             return False
 
+    def _reactivate_for_new_day(self, api_key: str, current_day: str) -> bool:
+        """
+        Reactivate an API key for a new local day, resetting the daily token counter.
+
+        Used when a key was deactivated due to ``daily_token_exceeded`` and the
+        local day (settings.app_timezone) has rolled over to midnight.
+
+        Args:
+            api_key: API key to reactivate
+            current_day: Current local day key (YYYY-MM-DD)
+
+        Returns:
+            True if reactivated successfully
+        """
+        try:
+            self.table.update_item(
+                Key={"api_key": api_key},
+                UpdateExpression="SET is_active = :active, daily_tokens_used = :zero, "
+                "daily_tokens_date = :day, deactivated_reason = :null, "
+                "updated_at = :updated_at",
+                ExpressionAttributeValues={
+                    ":active": True,
+                    ":zero": 0,
+                    ":day": current_day,
+                    ":null": None,
+                    ":updated_at": int(time.time()),
+                },
+            )
+            print(f"[APIKeyManager] Auto-reactivated key {api_key[:20]}... for new day {current_day}")
+            return True
+        except ClientError as e:
+            print(f"[APIKeyManager] Error reactivating key for new day: {e}")
+            return False
+
     def deactivate_api_key(self, api_key: str, reason: Optional[str] = None):
         """
         Deactivate an API key.
@@ -569,6 +664,27 @@ class APIKeyManager:
         try:
             self.deactivate_api_key(api_key, reason="budget_exceeded")
             print(f"[APIKeyManager] Deactivated key {api_key[:20]}... due to budget exceeded")
+            return True
+        except ClientError as e:
+            print(f"[APIKeyManager] Error deactivating key: {e}")
+            return False
+
+    def deactivate_for_daily_token_exceeded(self, api_key: str) -> bool:
+        """
+        Deactivate an API key due to the daily token limit being exceeded.
+
+        The key is auto-reactivated at the next local midnight (see
+        ``_reactivate_for_new_day`` invoked from ``validate_api_key``).
+
+        Args:
+            api_key: API key to deactivate
+
+        Returns:
+            True if deactivated successfully
+        """
+        try:
+            self.deactivate_api_key(api_key, reason="daily_token_exceeded")
+            print(f"[APIKeyManager] Deactivated key {api_key[:20]}... due to daily token limit exceeded")
             return True
         except ClientError as e:
             print(f"[APIKeyManager] Error deactivating key: {e}")
@@ -654,6 +770,9 @@ class APIKeyManager:
         budget_used: Optional[float] = None,
         budget_used_mtd: Optional[float] = None,
         budget_mtd_month: Optional[str] = None,
+        daily_token_limit: Optional[float] = None,
+        daily_tokens_used: Optional[int] = None,
+        daily_tokens_date: Optional[str] = None,
         tpm_limit: Optional[int] = None,
         rate_limit: Optional[int] = None,
         service_tier: Optional[str] = None,
@@ -718,6 +837,18 @@ class APIKeyManager:
         if budget_mtd_month is not None:
             update_parts.append("budget_mtd_month = :budget_mtd_month")
             expression_values[":budget_mtd_month"] = budget_mtd_month
+
+        if daily_token_limit is not None:
+            update_parts.append("daily_token_limit = :daily_token_limit")
+            expression_values[":daily_token_limit"] = Decimal(str(daily_token_limit))
+
+        if daily_tokens_used is not None:
+            update_parts.append("daily_tokens_used = :daily_tokens_used")
+            expression_values[":daily_tokens_used"] = int(daily_tokens_used)
+
+        if daily_tokens_date is not None:
+            update_parts.append("daily_tokens_date = :daily_tokens_date")
+            expression_values[":daily_tokens_date"] = daily_tokens_date
 
         if tpm_limit is not None:
             update_parts.append("tpm_limit = :tpm_limit")
@@ -906,6 +1037,83 @@ class APIKeyManager:
         except ClientError as e:
             print(f"[APIKeyManager] Error incrementing budget: {e}")
             return {"success": False, "budget_exceeded": False}
+
+    def increment_daily_tokens(
+        self,
+        api_key: str,
+        tokens: int,
+        check_daily_limit: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Increment the per-day token counter for an API key.
+
+        Handles day rollover (by ``settings.app_timezone``) by resetting the
+        counter when the local day changes. Optionally checks whether the daily
+        token usage exceeds ``daily_token_limit`` (stored in units of 万 / 10k
+        tokens) and deactivates the key (reason ``daily_token_exceeded``).
+
+        Args:
+            api_key: API key to update
+            tokens: Number of raw tokens to add (total_tokens of a request)
+            check_daily_limit: If True, deactivate when the limit is exceeded
+
+        Returns:
+            Dict with 'success', 'daily_exceeded', and optionally 'new_daily_tokens'
+        """
+        current_day = current_day_key()
+
+        try:
+            response = self.table.get_item(Key={"api_key": api_key})
+            item = response.get("Item")
+            if not item:
+                return {"success": False, "daily_exceeded": False}
+
+            existing_day = item.get("daily_tokens_date", "")
+            # Daily limit stored in 万 (10k); convert to raw tokens for comparison.
+            daily_token_limit_wan = float(item.get("daily_token_limit", 0) or 0)
+            daily_limit_tokens = daily_token_limit_wan * 10000
+
+            if existing_day != current_day:
+                # New local day - reset the counter to just this request's tokens.
+                self.table.update_item(
+                    Key={"api_key": api_key},
+                    UpdateExpression="SET daily_tokens_used = :tokens, "
+                    "daily_tokens_date = :day, updated_at = :updated_at",
+                    ExpressionAttributeValues={
+                        ":tokens": int(tokens),
+                        ":day": current_day,
+                        ":updated_at": int(time.time()),
+                    },
+                )
+                new_daily = int(tokens)
+            else:
+                self.table.update_item(
+                    Key={"api_key": api_key},
+                    UpdateExpression="SET daily_tokens_used = "
+                    "if_not_exists(daily_tokens_used, :zero) + :tokens, "
+                    "updated_at = :updated_at",
+                    ExpressionAttributeValues={
+                        ":tokens": int(tokens),
+                        ":zero": 0,
+                        ":updated_at": int(time.time()),
+                    },
+                )
+                new_daily = int(item.get("daily_tokens_used", 0) or 0) + int(tokens)
+
+            daily_exceeded = False
+            if check_daily_limit and daily_limit_tokens > 0 and new_daily >= daily_limit_tokens:
+                self.deactivate_for_daily_token_exceeded(api_key)
+                daily_exceeded = True
+
+            return {
+                "success": True,
+                "daily_exceeded": daily_exceeded,
+                "new_daily_tokens": new_daily,
+            }
+
+        except ClientError as e:
+            print(f"[APIKeyManager] Error incrementing daily tokens: {e}")
+            return {"success": False, "daily_exceeded": False}
 
 
 def _safe_resolve_model(model: str) -> str:
@@ -1567,7 +1775,8 @@ class UsageStatsManager:
         pricing_cache: Optional[Dict[str, Dict[str, Any]]] = None,
         model_mapping_cache: Optional[Dict[str, str]] = None,
         since_timestamp: Optional[int] = None,
-    ) -> Dict[str, Union[int, float]]:
+        collect_details: bool = False,
+    ) -> Dict[str, Any]:
         """
         Aggregate usage data for an API key from the usage table.
 
@@ -1590,6 +1799,12 @@ class UsageStatsManager:
         total_requests = 0
         total_cost = 0.0
         max_timestamp = since_timestamp or 0
+        # Tokens consumed on the current local day (app_timezone), used to
+        # enforce the per-day token limit.
+        daily_total_tokens = 0
+        today_local = current_local_date()
+        # Per-record detail rows for MySQL usage_detail (optional).
+        details: List[Dict[str, Any]] = []
 
         try:
             # Build query parameters
@@ -1626,13 +1841,30 @@ class UsageStatsManager:
                     record_timestamp = int(item.get("timestamp", 0))
                     metadata = item.get("metadata") or {}
 
-                    total_input_tokens += _displayed_input_tokens(
+                    displayed_input = _displayed_input_tokens(
                         input_tokens, cached_tokens, cache_write_tokens, metadata
                     )
+                    total_input_tokens += displayed_input
                     total_output_tokens += output_tokens
                     total_cached_tokens += cached_tokens
                     total_cache_write_tokens += cache_write_tokens
                     total_requests += 1
+
+                    # Accumulate tokens that fall on the current local day for
+                    # the per-day token limit (timestamp stored in milliseconds).
+                    try:
+                        record_dt = datetime.fromtimestamp(
+                            record_timestamp / 1000, tz=timezone.utc
+                        )
+                        if local_date_of(record_dt) == today_local:
+                            daily_total_tokens += (
+                                input_tokens
+                                + output_tokens
+                                + cached_tokens
+                                + cache_write_tokens
+                            )
+                    except (ValueError, OSError, OverflowError):
+                        pass
 
                     # Track the maximum timestamp processed
                     if record_timestamp > max_timestamp:
@@ -1640,6 +1872,8 @@ class UsageStatsManager:
 
                     # Calculate cost for this request if pricing is available
                     model = item.get("model", "")
+                    record_cost = 0.0
+                    bedrock_model_id = model
                     if pricing_cache and model:
                         # Resolve model ID to Bedrock format for pricing lookup
                         bedrock_model_id = self._resolve_model_id(model, model_mapping_cache)
@@ -1675,6 +1909,38 @@ class UsageStatsManager:
                                 + (cache_write_tokens * effective_cache_write_price / 1_000_000)
                             )
                             total_cost += cost
+                            record_cost = cost
+
+                    if collect_details:
+                        reasoning_tokens = int(item.get("reasoning_tokens", 0) or 0)
+                        try:
+                            req_dt = datetime.fromtimestamp(
+                                record_timestamp / 1000, tz=timezone.utc
+                            )
+                        except (ValueError, OSError, OverflowError):
+                            req_dt = datetime.now(timezone.utc)
+                        details.append(
+                            {
+                                "request_id": item.get("request_id"),
+                                "api_key": api_key,
+                                "model": model,
+                                "resolved_model": bedrock_model_id,
+                                "api_surface": item.get("api_surface"),
+                                "input_tokens": displayed_input,
+                                "output_tokens": output_tokens,
+                                "cache_read_tokens": cached_tokens,
+                                "cache_write_tokens": cache_write_tokens,
+                                "reasoning_tokens": reasoning_tokens,
+                                "total_tokens": displayed_input
+                                + output_tokens
+                                + cached_tokens
+                                + cache_write_tokens,
+                                "cost": record_cost,
+                                "success": bool(item.get("success", True)),
+                                "error_message": item.get("error_message"),
+                                "request_time": req_dt,
+                            }
+                        )
 
                 last_key = response.get("LastEvaluatedKey")
                 if not last_key:
@@ -1691,6 +1957,8 @@ class UsageStatsManager:
             "total_requests": total_requests,
             "total_cost": total_cost,
             "max_timestamp": max_timestamp,
+            "daily_total_tokens": daily_total_tokens,
+            "details": details,
         }
 
     @staticmethod
@@ -1770,12 +2038,20 @@ class UsageStatsManager:
                 if last_aggregated_timestamp is not None:
                     last_aggregated_timestamp = int(last_aggregated_timestamp)
 
-            # Aggregate usage (incrementally if we have a timestamp)
+            # Aggregate usage (incrementally if we have a timestamp). When MySQL
+            # is enabled, also collect per-record detail rows to persist.
+            try:
+                from app.db.mysql import is_enabled as _mysql_on
+                _collect = bool(_mysql_on())
+            except Exception:
+                _collect = False
+
             stats = self.aggregate_usage_for_key(
                 api_key,
                 pricing_cache,
                 model_mapping_cache,
                 since_timestamp=last_aggregated_timestamp,
+                collect_details=_collect,
             )
 
             # Skip if no new records were processed
@@ -1786,12 +2062,27 @@ class UsageStatsManager:
 
             # Get service tier multiplier for cost adjustment
             service_tier = "default"
+            key_user_id = None
             if api_key_manager:
                 api_key_info = api_key_manager.get_api_key(api_key)
                 if api_key_info:
                     service_tier = api_key_info.get("service_tier", "default")
+                    key_user_id = api_key_info.get("user_id")
             multiplier = self.get_service_tier_multiplier(service_tier)
             adjusted_cost = float(stats["total_cost"]) * multiplier
+
+            # Persist per-record usage detail to MySQL (cost adjusted by tier)
+            if _collect and stats.get("details"):
+                try:
+                    from app.db.mysql.repositories import UsageDetailRepository
+
+                    for d in stats["details"]:
+                        d["user_id"] = key_user_id
+                        d["service_tier"] = service_tier
+                        d["cost"] = float(d.get("cost", 0.0)) * multiplier
+                        UsageDetailRepository.insert(d)
+                except Exception as _detail_exc:
+                    print(f"[UsageStatsManager] Error writing usage detail to MySQL: {_detail_exc}")
 
             if last_aggregated_timestamp:
                 # Incremental update: add delta values to existing stats
@@ -1812,6 +2103,14 @@ class UsageStatsManager:
                         result = api_key_manager.increment_budget_used(api_key, adjusted_cost)
                         if result.get("budget_exceeded"):
                             print(f"[UsageStatsManager] API key {api_key[:20]}... exceeded budget")
+
+                    # Increment the per-day token counter and enforce daily limit
+                    if api_key_manager and int(stats.get("daily_total_tokens", 0)) > 0:
+                        daily_result = api_key_manager.increment_daily_tokens(
+                            api_key, int(stats["daily_total_tokens"])
+                        )
+                        if daily_result.get("daily_exceeded"):
+                            print(f"[UsageStatsManager] API key {api_key[:20]}... exceeded daily token limit")
             else:
                 # First run: set initial values
                 if self.update_stats(
@@ -1831,6 +2130,14 @@ class UsageStatsManager:
                         result = api_key_manager.increment_budget_used(api_key, adjusted_cost)
                         if result.get("budget_exceeded"):
                             print(f"[UsageStatsManager] API key {api_key[:20]}... exceeded budget")
+
+                    # Increment the per-day token counter and enforce daily limit
+                    if api_key_manager and int(stats.get("daily_total_tokens", 0)) > 0:
+                        daily_result = api_key_manager.increment_daily_tokens(
+                            api_key, int(stats["daily_total_tokens"])
+                        )
+                        if daily_result.get("daily_exceeded"):
+                            print(f"[UsageStatsManager] API key {api_key[:20]}... exceeded daily token limit")
 
         return count
 

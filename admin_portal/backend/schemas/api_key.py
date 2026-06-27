@@ -12,6 +12,9 @@ class ApiKeyCreate(BaseModel):
     owner_name: Optional[str] = Field(None, description="Display name for the owner")
     role: Optional[str] = Field("Full Access", description="Role type")
     monthly_budget: Optional[float] = Field(0, description="Monthly budget limit in USD")
+    daily_token_limit: Optional[float] = Field(
+        0, description="Daily token limit in units of wan (10k tokens); 0 = unlimited"
+    )
     rate_limit: Optional[int] = Field(None, description="Custom rate limit")
     service_tier: Optional[str] = Field(None, description="Bedrock service tier")
     cache_ttl: Optional[str] = Field(None, description="Cache TTL override ('5m' or '1h')")
@@ -27,6 +30,7 @@ class ApiKeyUpdate(BaseModel):
     owner_name: Optional[str] = None
     role: Optional[str] = None
     monthly_budget: Optional[float] = None
+    daily_token_limit: Optional[float] = None  # Units of wan (10k tokens); 0 = unlimited
     budget_used: Optional[float] = None
     rate_limit: Optional[int] = None
     service_tier: Optional[str] = None
@@ -54,6 +58,9 @@ class ApiKeyResponse(BaseModel):
     budget_used_mtd: Optional[float] = 0  # Month-to-date budget (resets monthly)
     budget_mtd_month: Optional[str] = None  # Month for MTD tracking (YYYY-MM)
     budget_history: Optional[str] = None  # Monthly budget history as JSON string (e.g., {"2025-11": 32.11})
+    daily_token_limit: Optional[float] = 0  # Daily token limit in wan (10k); 0 = unlimited
+    daily_tokens_used: Optional[int] = 0  # Raw tokens consumed for the current local day
+    daily_tokens_date: Optional[str] = None  # Local day key (YYYY-MM-DD)
     tpm_limit: Optional[int] = 100000
     updated_at: Optional[Union[int, str]] = None  # Accept both formats
     deactivated_reason: Optional[str] = None  # Reason for deactivation

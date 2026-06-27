@@ -40,6 +40,12 @@ import type {
   BetaHeaderCreate,
   BetaHeaderUpdate,
   BetaHeaderListResponse,
+  UsageStatsResponse,
+  ContentAuditListResponse,
+  ContentAuditRecord,
+  ContentAuditInfo,
+  ArchiveTask,
+  ArchiveHistoryRecord,
 } from '../types';
 
 const API_BASE_URL = '/api';
@@ -139,6 +145,49 @@ async function apiFetch<T>(
   }
 
   return response.json();
+}
+
+/**
+ * Authenticated download: fetches a file (e.g. markdown export) and triggers
+ * a browser download with the given filename.
+ */
+async function apiDownload(endpoint: string, filename: string): Promise<void> {
+  const headers: HeadersInit = {};
+  const token = await getAuthToken();
+  if (token) {
+    (headers as Record<string, string>)['Authorization'] = `Bearer ${token}`;
+  } else if (isAmplifyConfigured()) {
+    emitAuthError('no_token');
+    throw new Error('Authentication required');
+  }
+
+  const response = await fetch(`${API_BASE_URL}${endpoint}`, { headers });
+  if (!response.ok) {
+    if (response.status === 401) {
+      emitAuthError('unauthorized');
+      throw new Error('Session expired. Please login again.');
+    }
+    throw new Error(`Download failed: ${response.status}`);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.style.visibility = 'hidden';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+function buildQuery(params: Record<string, string | number | boolean | undefined | null>): string {
+  const sp = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== '') sp.set(k, String(v));
+  });
+  const q = sp.toString();
+  return q ? `?${q}` : '';
 }
 
 // Auth API
@@ -245,6 +294,109 @@ export const apiKeysApi = {
 
   getUsage: async (apiKey: string): Promise<ApiKeyUsage> => {
     return apiFetch(`/keys/${encodeURIComponent(apiKey)}/usage`);
+  },
+
+  syncToDynamo: async (): Promise<{ synced: number; failed: number; total?: number }> => {
+    return apiFetch('/keys/sync-to-dynamo', { method: 'POST' });
+  },
+};
+
+// Usage Statistics API
+export const usageStatsApi = {
+  get: async (params: {
+    group?: 'range' | 'day';
+    start?: string;
+    end?: string;
+    day?: string;
+    tz?: string;
+    include_empty?: boolean;
+  }): Promise<UsageStatsResponse> => {
+    return apiFetch(`/usage-stats${buildQuery(params)}`);
+  },
+};
+
+// Content Audit API
+export const contentAuditApi = {
+  list: async (params: {
+    api_key?: string;
+    user_id?: string;
+    start?: string;
+    end?: string;
+    tz?: string;
+    page?: number;
+    page_size?: number;
+  }): Promise<ContentAuditListResponse> => {
+    return apiFetch(`/content-audit${buildQuery(params)}`);
+  },
+
+  get: async (recordId: number): Promise<ContentAuditRecord> => {
+    return apiFetch(`/content-audit/${recordId}`);
+  },
+
+  exportMarkdown: async (params: {
+    api_key?: string;
+    user_id?: string;
+    start?: string;
+    end?: string;
+    tz?: string;
+    limit?: number;
+  }): Promise<void> => {
+    return apiDownload(
+      `/content-audit/export/markdown${buildQuery(params)}`,
+      'content-audit-export.md'
+    );
+  },
+};
+
+// Content Audit History (archiving) API
+export const contentAuditHistoryApi = {
+  info: async (tz?: string): Promise<ContentAuditInfo> => {
+    return apiFetch(`/content-audit-history/info${buildQuery({ tz })}`);
+  },
+
+  archive: async (keepDays: number, tz?: string): Promise<ArchiveTask> => {
+    return apiFetch('/content-audit-history/archive', {
+      method: 'POST',
+      body: JSON.stringify({ keep_days: keepDays, tz }),
+    });
+  },
+
+  status: async (taskId: number): Promise<ArchiveHistoryRecord> => {
+    return apiFetch(`/content-audit-history/archive/status/${taskId}`);
+  },
+
+  history: async (params: { start: string; end: string; tz?: string }): Promise<{
+    items: ArchiveHistoryRecord[];
+    count: number;
+  }> => {
+    return apiFetch(`/content-audit-history/history${buildQuery(params)}`);
+  },
+
+  archiveRecords: async (
+    table: string,
+    params: {
+      api_key?: string;
+      user_id?: string;
+      start?: string;
+      end?: string;
+      tz?: string;
+      page?: number;
+      page_size?: number;
+    }
+  ): Promise<ContentAuditListResponse> => {
+    return apiFetch(
+      `/content-audit-history/archive/${encodeURIComponent(table)}/records${buildQuery(params)}`
+    );
+  },
+
+  exportArchiveMarkdown: async (
+    table: string,
+    params: { api_key?: string; user_id?: string; start?: string; end?: string; tz?: string; limit?: number }
+  ): Promise<void> => {
+    return apiDownload(
+      `/content-audit-history/archive/${encodeURIComponent(table)}/export/markdown${buildQuery(params)}`,
+      `${table}-export.md`
+    );
   },
 };
 

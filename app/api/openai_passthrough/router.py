@@ -41,10 +41,12 @@ from app.api.openai_passthrough.web_search import (
     stream_response_events,
 )
 from app.core.config import settings
+from app.core.timezone import now_utc
 from app.db.dynamodb import DynamoDBClient, ModelMappingManager, UsageTracker
 from app.db.provider_manager import ProviderManager
 from app.middleware.auth import get_api_key_info
 from app.services.bedrock_service import BedrockService
+from app.services.content_audit_service import record_content_audit
 from app.services.web_search_service import get_web_search_service
 
 logger = logging.getLogger(__name__)
@@ -217,6 +219,68 @@ def _record_usage(
         logger.warning("[OPENAI-PASSTHROUGH] usage recording failed: %s", exc)
 
 
+def _extract_chat_completion_text(chat_data: dict[str, Any]) -> str | None:
+    """Extract assistant text from an OpenAI chat completion response dict."""
+    try:
+        choices = chat_data.get("choices") or []
+        parts: list[str] = []
+        for ch in choices:
+            msg = (ch or {}).get("message") or {}
+            content = msg.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("text"):
+                        parts.append(blk["text"])
+        return "\n".join(p for p in parts if p) or None
+    except Exception:  # pragma: no cover
+        return None
+
+
+def _passthrough_audit(
+    api_key_info: dict[str, Any],
+    *,
+    body: dict[str, Any],
+    response_text: str | None,
+    raw_usage: dict[str, Any] | None,
+    model: str,
+    api_surface: str,
+    streaming: bool,
+    request_time,
+    client_ip: str | None,
+    duration_ms: int | None,
+) -> None:
+    """Best-effort content audit for the OpenAI passthrough surfaces."""
+    try:
+        norm = normalize_usage(raw_usage or {}, api_surface)
+        record_content_audit(
+            request_id=None,
+            api_key=api_key_info.get("api_key"),
+            user_id=api_key_info.get("user_id"),
+            owner_name=api_key_info.get("owner_name"),
+            request_time=request_time,
+            model=model,
+            api_surface=api_surface,
+            service_tier=api_key_info.get("service_tier"),
+            system_prompt=None,
+            request_messages=body.get("messages") or body.get("input"),
+            tools=body.get("tools"),
+            response_content=response_text,
+            streaming=streaming,
+            input_tokens=norm.get("input_tokens", 0),
+            output_tokens=norm.get("output_tokens", 0),
+            cache_read_tokens=norm.get("cache_read_input_tokens", 0),
+            cache_write_tokens=norm.get("cache_creation_input_tokens", 0),
+            reasoning_tokens=norm.get("reasoning_tokens", 0),
+            duration_ms=duration_ms,
+            success=True,
+            client_ip=client_ip,
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("[OPENAI-PASSTHROUGH] content audit failed: %s", exc)
+
+
 def _api_error_response(exc: Exception) -> JSONResponse:
     return JSONResponse(
         {"error": {"message": str(exc), "type": "api_error"}},
@@ -239,6 +303,8 @@ async def chat_completions(
     api_key_info: dict[str, Any] = Depends(get_api_key_info),
 ):
     body = await request.json()
+    _audit_t0 = now_utc()
+    _audit_ip = request.client.host if request.client else None
     mapping, _, _ = _managers()
     body["model"] = resolve_model_id(body.get("model", ""), mapping)
     upstream_body = chat_request_to_response_request(body)
@@ -287,6 +353,19 @@ async def chat_completions(
 
         async def on_complete(usage: dict[str, Any]) -> None:
             _record_usage(api_key_info, usage, body["model"], "chat_completions")
+            # Best-effort content audit for streaming passthrough (no response text)
+            _passthrough_audit(
+                api_key_info,
+                body=body,
+                response_text=None,
+                raw_usage=usage,
+                model=body["model"],
+                api_surface="chat_completions",
+                streaming=True,
+                request_time=_audit_t0,
+                client_ip=_audit_ip,
+                duration_ms=None,
+            )
 
         return StreamingResponse(
             stream_responses_as_chat_completions(
@@ -322,6 +401,18 @@ async def chat_completions(
     )
     if isinstance(data, dict) and isinstance(data.get("usage"), dict):
         _record_usage(api_key_info, data["usage"], body["model"], "chat_completions")
+    _passthrough_audit(
+        api_key_info,
+        body=body,
+        response_text=_extract_chat_completion_text(chat_data),
+        raw_usage=data.get("usage") if isinstance(data, dict) else None,
+        model=body["model"],
+        api_surface="chat_completions",
+        streaming=False,
+        request_time=_audit_t0,
+        client_ip=_audit_ip,
+        duration_ms=None,
+    )
     return JSONResponse(chat_data, status_code=resp.status_code)
 
 

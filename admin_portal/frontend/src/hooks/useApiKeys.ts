@@ -84,3 +84,14 @@ export function useDeleteApiKey() {
     },
   });
 }
+
+export function useSyncKeysToDynamo() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: () => apiKeysApi.syncToDynamo(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiKeys'] });
+    },
+  });
+}

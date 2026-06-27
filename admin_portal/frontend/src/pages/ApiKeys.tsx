@@ -9,6 +9,7 @@ import {
   useDeleteApiKey,
   useDashboardStats,
   useProviders,
+  useSyncKeysToDynamo,
 } from '../hooks';
 import type { ApiKey, ApiKeyCreate, ApiKeyUpdate } from '../types';
 import { formatTokens, cacheHitRate, formatCacheHitRate } from '../utils';
@@ -70,6 +71,7 @@ function ApiKeyForm({
     // Use owner_name if set, otherwise fall back to user_id (same as list display)
     owner_name: initialData?.owner_name || initialData?.user_id || '',
     monthly_budget: initialData?.monthly_budget || 0,
+    daily_token_limit: initialData?.daily_token_limit || 0,
     rate_limit: initialData?.rate_limit || 1000,
     service_tier: initialData?.service_tier || 'default',
     cache_ttl: initialData?.cache_ttl || '',
@@ -158,6 +160,23 @@ function ApiKeyForm({
             className="w-full px-3 py-2 bg-input-bg border border-border-dark rounded-lg text-white focus:border-primary focus:ring-1 focus:ring-primary"
           />
         </div>
+      </div>
+
+      <div>
+        <label className="block text-sm font-medium text-slate-300 mb-1">
+          {t('apiKeys.form.dailyTokenLimit')}
+        </label>
+        <input
+          type="number"
+          step="0.1"
+          min="0"
+          value={formData.daily_token_limit}
+          onChange={(e) =>
+            setFormData({ ...formData, daily_token_limit: parseFloat(e.target.value) || 0 })
+          }
+          className="w-full px-3 py-2 bg-input-bg border border-border-dark rounded-lg text-white focus:border-primary focus:ring-1 focus:ring-primary"
+        />
+        <p className="mt-1 text-xs text-slate-500">{t('apiKeys.form.dailyTokenLimitDesc')}</p>
       </div>
 
       <div>
@@ -265,6 +284,17 @@ export default function ApiKeys() {
   const deactivateMutation = useDeactivateApiKey();
   const reactivateMutation = useReactivateApiKey();
   const deleteMutation = useDeleteApiKey();
+  const syncMutation = useSyncKeysToDynamo();
+
+  const handleSyncToDynamo = async () => {
+    if (!confirm(t('apiKeys.confirmSync'))) return;
+    try {
+      const result = await syncMutation.mutateAsync();
+      alert(t('apiKeys.syncResult', { synced: result.synced, failed: result.failed }));
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  };
 
   const handleCreate = async (data: ApiKeyCreate | ApiKeyUpdate) => {
     await createMutation.mutateAsync(data as ApiKeyCreate);
@@ -301,7 +331,7 @@ export default function ApiKeys() {
       return;
     }
 
-    const headers = ['API Key', 'Name', 'Owner', 'User ID', 'Status', 'Monthly Budget', 'Budget Used (MTD)', 'Budget Used (Total)', 'Rate Limit', 'Service Tier', 'Cache TTL', 'Created At', 'Total Requests', 'Total Input Tokens', 'Total Output Tokens', 'Total Cached Tokens', 'Total Cache Write Tokens', 'Cache Hit Rate (%)'];
+    const headers = ['API Key', 'Name', 'Owner', 'User ID', 'Status', 'Monthly Budget', 'Budget Used (MTD)', 'Budget Used (Total)', 'Daily Token Limit (10K)', 'Daily Tokens Used', 'Rate Limit', 'Service Tier', 'Cache TTL', 'Created At', 'Total Requests', 'Total Input Tokens', 'Total Output Tokens', 'Total Cached Tokens', 'Total Cache Write Tokens', 'Cache Hit Rate (%)'];
 
     const rows = apiKeys.map((key) => {
       const hitRate = cacheHitRate(
@@ -318,6 +348,8 @@ export default function ApiKeys() {
         key.monthly_budget || 0,
         key.budget_used_mtd || 0,
         key.budget_used || 0,
+        key.daily_token_limit || 0,
+        key.daily_tokens_used || 0,
         key.rate_limit || 0,
         key.service_tier || 'default',
         key.cache_ttl || 'default',
@@ -462,6 +494,15 @@ export default function ApiKeys() {
             {t('apiKeys.export')}
           </button>
           <button
+            onClick={handleSyncToDynamo}
+            disabled={syncMutation.isPending}
+            className="flex items-center justify-center gap-2 h-10 px-4 rounded-lg bg-surface-dark border border-border-dark text-white text-sm font-medium hover:bg-border-dark transition-colors disabled:opacity-50"
+            title={t('apiKeys.syncToDynamoDesc')}
+          >
+            <span className={`material-symbols-outlined text-[20px] ${syncMutation.isPending ? 'animate-spin' : ''}`}>sync</span>
+            {t('apiKeys.syncToDynamo')}
+          </button>
+          <button
             onClick={() => setShowCreateModal(true)}
             className="flex items-center justify-center gap-2 h-10 px-4 rounded-lg bg-primary text-white text-sm font-bold shadow-lg shadow-primary/25 hover:bg-primary/90 transition-all"
           >
@@ -600,6 +641,9 @@ export default function ApiKeys() {
                   {t('apiKeys.monthlyBudget')}
                 </th>
                 <th className="px-6 py-4 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                  {t('apiKeys.dailyTokenLimit')}
+                </th>
+                <th className="px-6 py-4 text-xs font-semibold text-slate-400 uppercase tracking-wider">
                   {t('apiKeys.lastMonth')}
                 </th>
                 <th className="px-6 py-4 text-xs font-semibold text-slate-400 uppercase tracking-wider">
@@ -625,7 +669,7 @@ export default function ApiKeys() {
             <tbody className="divide-y divide-border-dark">
               {isLoading ? (
                 <tr>
-                  <td colSpan={11} className="px-6 py-12 text-center">
+                  <td colSpan={12} className="px-6 py-12 text-center">
                     <span className="material-symbols-outlined animate-spin text-4xl text-primary">
                       progress_activity
                     </span>
@@ -633,7 +677,7 @@ export default function ApiKeys() {
                 </tr>
               ) : data?.items.length === 0 ? (
                 <tr>
-                  <td colSpan={11} className="px-6 py-12 text-center text-slate-400">
+                  <td colSpan={12} className="px-6 py-12 text-center text-slate-400">
                     No API keys found
                   </td>
                 </tr>
@@ -792,6 +836,32 @@ export default function ApiKeys() {
                           </div>
                         </div>
                       </td>
+                      <td className="px-6 py-4 whitespace-nowrap align-middle">
+                        {(() => {
+                          const limitWan = key.daily_token_limit || 0;
+                          const usedTokens = key.daily_tokens_used || 0;
+                          if (limitWan <= 0) {
+                            return <span className="text-xs text-slate-500">{t('apiKeys.unlimited')}</span>;
+                          }
+                          const limitTokens = limitWan * 10000;
+                          const pct = Math.round((usedTokens / limitTokens) * 100);
+                          return (
+                            <div className="w-full flex flex-col gap-1.5 min-w-[120px]">
+                              <div className="flex justify-between text-xs">
+                                <span className="text-white font-medium">{formatTokens(usedTokens)}</span>
+                                <span className="text-slate-500">/ {limitWan}{t('apiKeys.wan')}</span>
+                              </div>
+                              <div className="w-full bg-border-dark h-2 rounded-full overflow-hidden">
+                                <div
+                                  className={`h-full rounded-full ${pct >= 100 ? 'bg-red-500' : pct > 75 ? 'bg-orange-500' : 'bg-primary'}`}
+                                  style={{ width: `${Math.min(pct, 100)}%` }}
+                                ></div>
+                              </div>
+                              <span className="text-[10px] text-slate-500">{pct}% {t('apiKeys.used')}</span>
+                            </div>
+                          );
+                        })()}
+                      </td>
                       <td className="px-6 py-4 whitespace-nowrap">
                         {(() => {
                           const lastMonthBudget = getLastMonthBudget(key.budget_history);
@@ -856,7 +926,7 @@ export default function ApiKeys() {
                           className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${
                             key.is_active
                               ? 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20'
-                              : key.deactivated_reason === 'budget_exceeded'
+                              : key.deactivated_reason === 'budget_exceeded' || key.deactivated_reason === 'daily_token_exceeded'
                               ? 'bg-red-500/10 text-red-400 border-red-500/20'
                               : 'bg-slate-100 dark:bg-border-dark text-slate-500 border-slate-200 dark:border-slate-700'
                           }`}
@@ -865,7 +935,7 @@ export default function ApiKeys() {
                             className={`size-1.5 rounded-full ${
                               key.is_active
                                 ? 'bg-emerald-500'
-                                : key.deactivated_reason === 'budget_exceeded'
+                                : key.deactivated_reason === 'budget_exceeded' || key.deactivated_reason === 'daily_token_exceeded'
                                 ? 'bg-red-400'
                                 : 'bg-slate-500'
                             }`}
@@ -874,6 +944,8 @@ export default function ApiKeys() {
                             ? t('common.active')
                             : key.deactivated_reason === 'budget_exceeded'
                             ? t('apiKeys.budgetExceeded')
+                            : key.deactivated_reason === 'daily_token_exceeded'
+                            ? t('apiKeys.dailyLimitExceeded')
                             : t('common.revoked')}
                         </span>
                       </td>

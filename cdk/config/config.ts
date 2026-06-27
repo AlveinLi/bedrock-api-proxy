@@ -109,6 +109,19 @@ export interface EnvironmentConfig {
   dynamodbReadCapacity?: number;
   dynamodbWriteCapacity?: number;
 
+  // MySQL Persistence (usage detail, content audit, API key master store)
+  mysqlEnabled: boolean;             // Provision RDS MySQL and wire it into the services
+  mysqlDatabase: string;             // Database/schema name
+  mysqlUser: string;                 // Master username
+  mysqlPassword: string;             // Master password (plaintext config; set via MYSQL_PASSWORD at deploy time)
+  mysqlInstanceClass: string;        // RDS instance type, e.g. 't3.small', 't4g.small'
+  mysqlAllocatedStorage: number;     // Initial storage in GB (auto-scales up to 4x)
+  mysqlMultiAz: boolean;             // Multi-AZ for high availability (recommended for prod)
+
+  // Content Audit + Timezone
+  contentAuditEnabled: boolean;      // Persist request/response content to MySQL
+  appTimezone: string;              // IANA timezone for day/month boundaries (e.g. 'Asia/Shanghai')
+
   // Logging Configuration
   logRetentionDays: number;
   enableContainerInsights: boolean;
@@ -214,6 +227,19 @@ export const environments: { [key: string]: EnvironmentConfigWithoutRuntime } = 
     // DynamoDB
     dynamodbBillingMode: 'PAY_PER_REQUEST',
 
+    // MySQL Persistence (opt-in: set MYSQL_ENABLED=true at deploy time to provision RDS)
+    mysqlEnabled: false,
+    mysqlDatabase: 'anthropic_proxy',
+    mysqlUser: 'proxy',
+    mysqlPassword: 'proxy_password',
+    mysqlInstanceClass: 't4g.small',
+    mysqlAllocatedStorage: 20,
+    mysqlMultiAz: false,
+
+    // Content Audit + Timezone
+    contentAuditEnabled: false,
+    appTimezone: 'Asia/Shanghai',
+
     // CloudFront (HTTPS)
     enableCloudFront: false,
     cloudFrontOriginReadTimeout: 60,  // Max 60s default; request AWS quota increase for up to 180s
@@ -318,6 +344,19 @@ export const environments: { [key: string]: EnvironmentConfigWithoutRuntime } = 
 
     // DynamoDB
     dynamodbBillingMode: 'PAY_PER_REQUEST',
+
+    // MySQL Persistence (opt-in: set MYSQL_ENABLED=true at deploy time to provision RDS)
+    mysqlEnabled: false,
+    mysqlDatabase: 'anthropic_proxy',
+    mysqlUser: 'proxy',
+    mysqlPassword: 'proxy_password',
+    mysqlInstanceClass: 't4g.medium',
+    mysqlAllocatedStorage: 20,
+    mysqlMultiAz: false,
+
+    // Content Audit + Timezone
+    contentAuditEnabled: false,
+    appTimezone: 'Asia/Shanghai',
 
     // CloudFront (HTTPS)
     enableCloudFront: false,
@@ -425,6 +464,15 @@ export function getConfig(environmentName: string = 'dev'): EnvironmentConfig {
     ? process.env.ENABLE_CLOUDFRONT.toLowerCase() === 'true'
     : config.enableCloudFront;
 
+  // Override MySQL / content audit settings from environment variables
+  const mysqlEnabled = process.env.MYSQL_ENABLED
+    ? process.env.MYSQL_ENABLED.toLowerCase() === 'true'
+    : config.mysqlEnabled;
+
+  const contentAuditEnabled = process.env.CONTENT_AUDIT_ENABLED
+    ? process.env.CONTENT_AUDIT_ENABLED.toLowerCase() === 'true'
+    : config.contentAuditEnabled;
+
   return {
     ...config,
     platform,
@@ -437,6 +485,15 @@ export function getConfig(environmentName: string = 'dev'): EnvironmentConfig {
     enableOpenaiCompat,
     enableOpenaiPassthrough,
     enableCloudFront,
+    mysqlEnabled,
+    contentAuditEnabled,
+    ...(process.env.APP_TIMEZONE && { appTimezone: process.env.APP_TIMEZONE }),
+    ...(process.env.MYSQL_DATABASE && { mysqlDatabase: process.env.MYSQL_DATABASE }),
+    ...(process.env.MYSQL_USER && { mysqlUser: process.env.MYSQL_USER }),
+    ...(process.env.MYSQL_PASSWORD && { mysqlPassword: process.env.MYSQL_PASSWORD }),
+    ...(process.env.MYSQL_INSTANCE_CLASS && { mysqlInstanceClass: process.env.MYSQL_INSTANCE_CLASS }),
+    ...(process.env.MYSQL_ALLOCATED_STORAGE && { mysqlAllocatedStorage: parseInt(process.env.MYSQL_ALLOCATED_STORAGE) }),
+    ...(process.env.MYSQL_MULTI_AZ && { mysqlMultiAz: process.env.MYSQL_MULTI_AZ.toLowerCase() === 'true' }),
     ...((process.env.MANTLE_ENDPOINT_URL || process.env.OPENAI_BASE_URL) && {
       openaiBaseUrl: process.env.MANTLE_ENDPOINT_URL || process.env.OPENAI_BASE_URL,
     }),

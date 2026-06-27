@@ -7,6 +7,7 @@ Supports Programmatic Tool Calling (PTC) via Docker sandbox execution.
 import hashlib
 import json
 import logging
+import time
 from typing import Optional
 from uuid import uuid4
 
@@ -15,8 +16,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.config import settings
 from app.core.exceptions import BedrockAPIError, NoProviderAvailableError
+from app.core.timezone import now_utc
 from app.db.dynamodb import DynamoDBClient, UsageTracker
 from app.middleware.auth import get_api_key_info
+from app.services.content_audit_service import record_content_audit
 from app.schemas.anthropic import (
     CountTokensRequest,
     CountTokensResponse,
@@ -294,6 +297,9 @@ async def create_message(
         HTTPException: For various error conditions
     """
     request_id = f"msg-{uuid4().hex}"
+    _audit_request_time = now_utc()
+    _audit_perf_start = time.perf_counter()
+    _client_ip = request.client.host if request.client else None
 
     # Resolve any image URL sources (download + base64) before downstream processing.
     # Mutates request_data.messages in place; raises ImageUrlFetchError on any failure.
@@ -976,6 +982,9 @@ async def create_message(
                 anthropic_beta,
                 cache_ttl=cache_ttl,
                 effective_cache_ttl=effective_cache_ttl,
+                audit_request_time=_audit_request_time,
+                audit_perf_start=_audit_perf_start,
+                client_ip=_client_ip,
             )
             # Wrap with tracing accumulator if tracing is enabled
             if _trace_span is not None:
@@ -1061,6 +1070,35 @@ async def create_message(
                 success=True,
                 cache_ttl=effective_cache_ttl,
             )
+
+            # Content audit (independent of OTEL_TRACE_CONTENT)
+            try:
+                record_content_audit(
+                    request_id=request_id,
+                    api_key=api_key_info.get("api_key"),
+                    user_id=api_key_info.get("user_id"),
+                    owner_name=api_key_info.get("owner_name"),
+                    request_time=_audit_request_time,
+                    model=request_data.model,
+                    resolved_model=getattr(response, "model", None),
+                    api_surface="messages",
+                    service_tier=service_tier,
+                    system_prompt=request_data.system,
+                    request_messages=request_data.messages,
+                    tools=request_data.tools,
+                    response_content=_extract_response_text(response),
+                    stop_reason=getattr(response, "stop_reason", None),
+                    streaming=False,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    cache_read_tokens=response.usage.cache_read_input_tokens or 0,
+                    cache_write_tokens=response.usage.cache_creation_input_tokens or 0,
+                    duration_ms=int((time.perf_counter() - _audit_perf_start) * 1000),
+                    success=True,
+                    client_ip=_client_ip,
+                )
+            except Exception as _audit_exc:  # pragma: no cover
+                logger.error(f"Content audit failed for {request_id}: {_audit_exc}")
 
             return response
 
@@ -1280,6 +1318,9 @@ async def _handle_streaming_request(
     anthropic_beta: Optional[str] = None,
     cache_ttl: Optional[str] = None,
     effective_cache_ttl: Optional[str] = None,
+    audit_request_time=None,
+    audit_perf_start: Optional[float] = None,
+    client_ip: Optional[str] = None,
 ):
     """
     Handle streaming request and yield SSE events.
@@ -1300,6 +1341,9 @@ async def _handle_streaming_request(
     success = True
     error_message = None
     provider_id = api_key_info.get("provider_id") if api_key_info else None
+    # Accumulate response content + stop_reason for content audit (independent of OTEL)
+    _audit_text_parts: list[str] = []
+    _audit_stop_reason: Optional[str] = None
 
     print(f"[STREAMING] Starting stream for request {request_id}")
     print(f"[STREAMING] Service tier: {service_tier}")
@@ -1342,6 +1386,16 @@ async def _handle_streaming_request(
                                 accumulated_tokens["cached"] = usage["cache_read_input_tokens"]
                             if "cache_creation_input_tokens" in usage:
                                 accumulated_tokens["cache_write"] = usage["cache_creation_input_tokens"]
+                            # Capture stop_reason for content audit
+                            _delta = event_data.get("delta") or {}
+                            if _delta.get("stop_reason"):
+                                _audit_stop_reason = _delta["stop_reason"]
+
+                        # Accumulate assistant text for content audit
+                        elif event_type == "content_block_delta":
+                            _delta = event_data.get("delta") or {}
+                            if _delta.get("type") == "text_delta" and _delta.get("text"):
+                                _audit_text_parts.append(_delta["text"])
                 except (json.JSONDecodeError, IndexError, KeyError):
                     # Ignore parse errors - not all events have usage data
                     pass
@@ -1381,6 +1435,40 @@ async def _handle_streaming_request(
             error_message=error_message,
             cache_ttl=effective_cache_ttl,
         )
+
+        # Content audit (independent of OTEL_TRACE_CONTENT)
+        try:
+            _duration_ms = (
+                int((time.perf_counter() - audit_perf_start) * 1000)
+                if audit_perf_start is not None
+                else None
+            )
+            record_content_audit(
+                request_id=request_id,
+                api_key=api_key_info.get("api_key"),
+                user_id=api_key_info.get("user_id"),
+                owner_name=api_key_info.get("owner_name"),
+                request_time=audit_request_time,
+                model=request_data.model,
+                api_surface="messages",
+                service_tier=service_tier,
+                system_prompt=request_data.system,
+                request_messages=request_data.messages,
+                tools=request_data.tools,
+                response_content="".join(_audit_text_parts) if _audit_text_parts else None,
+                stop_reason=_audit_stop_reason,
+                streaming=True,
+                input_tokens=accumulated_tokens["input"],
+                output_tokens=accumulated_tokens["output"],
+                cache_read_tokens=accumulated_tokens["cached"],
+                cache_write_tokens=accumulated_tokens["cache_write"],
+                duration_ms=_duration_ms,
+                success=success,
+                error_message=error_message,
+                client_ip=client_ip,
+            )
+        except Exception as _audit_exc:  # pragma: no cover
+            logger.error(f"Content audit failed for {request_id}: {_audit_exc}")
 
 
 @router.get(

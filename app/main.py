@@ -207,6 +207,21 @@ async def lifespan(app: FastAPI):
         init_tracing()
         print("OpenTelemetry tracing initialized")
 
+    # Initialize MySQL schema + content audit worker
+    if settings.mysql_enabled:
+        try:
+            from app.db.mysql import init_db
+            init_db()
+            print("MySQL schema ensured")
+        except Exception as e:
+            import logging as _log
+            _log.getLogger(__name__).error(f"Failed to initialize MySQL schema: {e}")
+
+    if settings.content_audit_enabled and settings.mysql_enabled:
+        from app.services.content_audit_service import start_content_audit
+        start_content_audit()
+        print("Content audit worker started")
+
     yield
 
     # Shutdown
@@ -217,6 +232,12 @@ async def lifespan(app: FastAPI):
         from app.tracing import shutdown_tracing
         shutdown_tracing()
         print("OpenTelemetry tracing shut down")
+
+    # Stop content audit worker
+    if settings.content_audit_enabled:
+        from app.services.content_audit_service import stop_content_audit
+        stop_content_audit()
+        print("Content audit worker stopped")
 
     # Cleanup PTC Docker containers
     await cleanup_ptc_resources()

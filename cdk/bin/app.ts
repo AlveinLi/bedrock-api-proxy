@@ -5,6 +5,7 @@ import { DynamoDBStack } from '../lib/dynamodb-stack';
 import { NetworkStack } from '../lib/network-stack';
 import { ECSStack } from '../lib/ecs-stack';
 import { CognitoStack } from '../lib/cognito-stack';
+import { DatabaseStack } from '../lib/database-stack';
 import { getConfig } from '../config/config';
 
 const app = new cdk.App();
@@ -53,6 +54,19 @@ const cognitoStack = config.adminPortalEnabled
     })
   : undefined;
 
+// Deploy Database Stack (RDS MySQL) — only when MySQL persistence is enabled
+const databaseStack = config.mysqlEnabled
+  ? new DatabaseStack(app, `${stackPrefix}-Database`, {
+      env,
+      config,
+      vpc: networkStack.vpc,
+      ecsSecurityGroup: networkStack.ecsSecurityGroup,
+      stackName: `${stackPrefix}-Database`,
+      description: `RDS MySQL for Anthropic proxy ${config.environmentName}`,
+      tags: config.tags,
+    })
+  : undefined;
+
 // Deploy ECS Stack
 const ecsStack = new ECSStack(app, `${stackPrefix}-ECS`, {
   env,
@@ -60,6 +74,7 @@ const ecsStack = new ECSStack(app, `${stackPrefix}-ECS`, {
   vpc: networkStack.vpc,
   albSecurityGroup: networkStack.albSecurityGroup,
   ecsSecurityGroup: networkStack.ecsSecurityGroup,
+  database: databaseStack?.instance,
   apiKeysTable: dynamoDBStack.apiKeysTable,
   usageTable: dynamoDBStack.usageTable,
   modelMappingTable: dynamoDBStack.modelMappingTable,
@@ -85,6 +100,10 @@ ecsStack.addDependency(dynamoDBStack);
 ecsStack.addDependency(networkStack);
 if (cognitoStack) {
   ecsStack.addDependency(cognitoStack);
+}
+if (databaseStack) {
+  databaseStack.addDependency(networkStack);
+  ecsStack.addDependency(databaseStack);
 }
 
 // Add tags to all stacks

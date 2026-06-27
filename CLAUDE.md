@@ -13,6 +13,7 @@ cp .env.example .env       # configure AWS credentials + settings
 
 # Setup
 uv run scripts/setup_tables.py
+uv run scripts/setup_mysql.py # only when MYSQL_ENABLED=True (creates proxy_* MySQL tables)
 uv run scripts/create_api_key.py --user-id dev-user --name "Development Key"
 
 # Run
@@ -67,6 +68,21 @@ All config in `app/core/config.py` (Pydantic Settings, loads from env vars / `.e
 
 > **Full schema, budget computation, and aggregation details**: see [docs/architecture/detailed-flows.md](docs/architecture/detailed-flows.md)
 
+### MySQL Persistence (optional, `MYSQL_ENABLED`)
+
+When `MYSQL_ENABLED=True`, MySQL (`app/db/mysql/`, SQLAlchemy) becomes the master store for API keys and the persistent home for detailed usage + content audit. All timestamps are stored in UTC; day/month boundaries and display use `APP_TIMEZONE` (see `app/core/timezone.py`). Tables (prefixed by `MYSQL_TABLE_PREFIX`, default `proxy_`):
+
+| Table | Purpose |
+|-------|---------|
+| `proxy_api_keys` | API key master records (source of truth, synced to DynamoDB) |
+| `proxy_usage_detail` | Per-request usage detail with cost (written by the usage aggregator) |
+| `proxy_content_audit` | Full request/response content for every request (auditing) |
+| `proxy_content_audit_archive_history` | History of content-audit archive operations |
+| `proxy_content_audit_<YYYYMMDDHHMM>` | Dynamically created archive tables (old audit rows moved here) |
+
+- **API key writes are MySQL-first**: admin create/update/delete write MySQL then sync to DynamoDB (`admin_portal/backend/services/api_key_store.py`). `POST /api/keys/sync-to-dynamo` overwrites DynamoDB from the full MySQL set.
+- Setup: `uv run scripts/setup_mysql.py` (or schema is auto-ensured at proxy/admin startup). Local stack: `docker-compose up -d` now includes a `mysql` service.
+
 ## Project Structure
 
 ```
@@ -120,6 +136,9 @@ Each feature has detailed docs in [docs/architecture/features.md](docs/architect
 - **OpenAI-Compatible API**: Non-Claude models can optionally use Bedrock's OpenAI Chat Completions API via bedrock-mantle endpoint instead of Converse API. Controlled by `ENABLE_OPENAI_COMPAT` flag. Maps `thinking` to OpenAI `reasoning` with configurable effort thresholds.
 - **OpenAI Passthrough**: New `/openai/v1/*` endpoints accept OpenAI-native Chat Completions and Responses API requests and forward them to bedrock-mantle. Distinct from `ENABLE_OPENAI_COMPAT` (which routes Anthropic-format requests on `/v1/messages`). Reuses proxy API key auth, rate limits, budgets, and usage tracking. Controlled by `ENABLE_OPENAI_PASSTHROUGH`.
 - **Multi-Provider Gateway**: Optional gateway layer for multiple Bedrock accounts/providers — routing engine (rule/cost/quality/RouteLLM smart routing), encrypted key pool with rotation + cross-model failover, and context compression. Managed via admin portal (`providers`, `provider_keys`, `routing`, `failover`). Controlled by `MULTI_PROVIDER_ENABLED` and sub-flags. See [docs/smart-routing-guide.md](docs/smart-routing-guide.md).
+- **Daily Token Limit**: Per-key daily token cap (units of 万/10k tokens) configured in the admin "Edit API Key" form. The usage aggregator accumulates the day's tokens (local-day boundary via `APP_TIMEZONE`); when exceeded the key is deactivated (`deactivated_reason="daily_token_exceeded"`) and auto-reactivated at the next local midnight in `validate_api_key`. Mirrors the monthly budget mechanism.
+- **MySQL Persistence + Content Audit**: When `MYSQL_ENABLED=True`, API keys, per-request usage detail, and full request/response content audit are persisted to MySQL. Content auditing (`CONTENT_AUDIT_ENABLED`, written asynchronously by `app/services/content_audit_service.py`) is independent of `OTEL_TRACE_CONTENT`. Admin pages: Usage Stats (per-user aggregation over a time range/day), Content Audit (paginated, markdown render + export), Content Audit History (async archiving of old rows into timestamped tables + querying archives).
+- **Local File Logging**: `LOG_TO_FILE=True` adds a `RotatingFileHandler` (path `LOG_FILE_PATH`); `LOG_TO_STDOUT=False` writes only to file, avoiding dependence on CloudWatch.
 
 ## Common Development Tasks
 
@@ -183,6 +202,8 @@ Key CDK files: `cdk/config/config.ts`, `cdk/lib/ecs-stack.ts`, `cdk/scripts/depl
 **OpenAI-Compat:** `ENABLE_OPENAI_COMPAT`, `ENABLE_OPENAI_PASSTHROUGH`, `BEDROCK_API_KEY`, `MANTLE_ENDPOINT_URL`, `OPENAI_COMPAT_THINKING_HIGH_THRESHOLD`, `OPENAI_COMPAT_THINKING_MEDIUM_THRESHOLD`
 
 **Multi-Provider Gateway:** `MULTI_PROVIDER_ENABLED`, `ROUTING_ENABLED`, `SMART_ROUTING_ENABLED`, `FAILOVER_ENABLED`, `COMPRESSION_ENABLED`, `CACHE_AWARE_ROUTING_ENABLED`, `PROVIDER_KEY_ENCRYPTION_SECRET`
+
+**MySQL / Content Audit / Logging / Timezone:** `MYSQL_ENABLED`, `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE`, `MYSQL_TABLE_PREFIX`, `MYSQL_DSN`, `CONTENT_AUDIT_ENABLED`, `APP_TIMEZONE`, `LOG_TO_FILE`, `LOG_TO_STDOUT`, `LOG_FILE_PATH`
 
 See `.env.example` for full list including PTC, web search, web fetch, cache TTL, tracing, beta header, and multi-provider settings.
 

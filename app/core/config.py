@@ -28,6 +28,43 @@ class Settings(BaseSettings):
     debug: bool = Field(default=False, alias="DEBUG")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    # Application timezone used for all "day"/"month" boundary calculations
+    # (e.g. daily token limit reset at local midnight) and as the default
+    # display timezone in the admin portal. Data is always stored in UTC.
+    app_timezone: str = Field(
+        default="Asia/Shanghai",
+        alias="APP_TIMEZONE",
+        description="IANA timezone name (e.g. 'Asia/Shanghai', 'UTC') used for day/month boundaries and default display tz",
+    )
+
+    # Local file logging (alternative/supplement to stdout -> CloudWatch).
+    # When log_to_file=True, a RotatingFileHandler writing to log_file_path is added.
+    log_to_file: bool = Field(
+        default=False,
+        alias="LOG_TO_FILE",
+        description="When True, also write logs to a local rotating file (avoids depending on CloudWatch)",
+    )
+    log_file_path: str = Field(
+        default="logs/app.log",
+        alias="LOG_FILE_PATH",
+        description="Path of the local log file when LOG_TO_FILE=True",
+    )
+    log_file_max_bytes: int = Field(
+        default=50 * 1024 * 1024,
+        alias="LOG_FILE_MAX_BYTES",
+        description="Max bytes per log file before rotation",
+    )
+    log_file_backup_count: int = Field(
+        default=10,
+        alias="LOG_FILE_BACKUP_COUNT",
+        description="Number of rotated log files to keep",
+    )
+    log_to_stdout: bool = Field(
+        default=True,
+        alias="LOG_TO_STDOUT",
+        description="When True, emit logs to stdout (set False to write only to file)",
+    )
+
     # Server Settings
     host: str = Field(default="0.0.0.0", alias="HOST")
     port: int = Field(default=8000, alias="PORT")
@@ -547,6 +584,47 @@ class Settings(BaseSettings):
         default="anthropic-proxy-smart-routing-config", alias="DYNAMODB_SMART_ROUTING_CONFIG_TABLE"
     )
 
+    # === MySQL Persistence ===
+    # MySQL stores: API key master records (synced to DynamoDB), per-request
+    # usage detail, content audit (request/response content), and archive history.
+    mysql_enabled: bool = Field(
+        default=False,
+        alias="MYSQL_ENABLED",
+        description="Master switch for MySQL persistence (usage detail, content audit, API key store)",
+    )
+    mysql_host: str = Field(default="localhost", alias="MYSQL_HOST")
+    mysql_port: int = Field(default=3306, alias="MYSQL_PORT")
+    mysql_user: str = Field(default="proxy", alias="MYSQL_USER")
+    mysql_password: str = Field(default="", alias="MYSQL_PASSWORD")
+    mysql_database: str = Field(default="anthropic_proxy", alias="MYSQL_DATABASE")
+    mysql_table_prefix: str = Field(
+        default="proxy_",
+        alias="MYSQL_TABLE_PREFIX",
+        description="Prefix applied to all MySQL table names (incl. content audit archive tables)",
+    )
+    mysql_pool_size: int = Field(default=10, alias="MYSQL_POOL_SIZE")
+    mysql_pool_max_overflow: int = Field(default=20, alias="MYSQL_POOL_MAX_OVERFLOW")
+    mysql_echo: bool = Field(default=False, alias="MYSQL_ECHO")
+    mysql_dsn: Optional[str] = Field(
+        default=None,
+        alias="MYSQL_DSN",
+        description="Optional full SQLAlchemy DSN; overrides individual host/port/user/... fields when set",
+    )
+
+    # === Content Audit ===
+    # Independent of OTEL_TRACE_CONTENT: when enabled, every request's content
+    # (prompt + LLM response) is persisted to MySQL for auditing.
+    content_audit_enabled: bool = Field(
+        default=True,
+        alias="CONTENT_AUDIT_ENABLED",
+        description="Persist request/response content to MySQL for auditing (independent of OTEL_TRACE_CONTENT)",
+    )
+    content_audit_queue_max_size: int = Field(
+        default=10000,
+        alias="CONTENT_AUDIT_QUEUE_MAX_SIZE",
+        description="Max in-memory queue size for async content audit writes",
+    )
+
     @field_validator("cors_origins", "cors_allow_methods", "cors_allow_headers", mode="before")
     @classmethod
     def parse_list_fields(cls, v: Any) -> List[str]:
@@ -576,6 +654,18 @@ class Settings(BaseSettings):
         v = v.lower()
         if v not in valid_envs:
             raise ValueError(f"Environment must be one of {valid_envs}")
+        return v
+
+    @field_validator("app_timezone")
+    @classmethod
+    def validate_app_timezone(cls, v):
+        """Validate the application timezone is a known IANA name."""
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"Invalid APP_TIMEZONE '{v}': {exc}")
         return v
 
 
