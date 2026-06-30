@@ -10,7 +10,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from app.db.mysql.engine import session_scope
 from app.db.mysql.models import (
@@ -164,18 +164,30 @@ class ContentAuditRepository:
         cls,
         api_key: Optional[str] = None,
         user_id: Optional[str] = None,
+        user_or_owner: Optional[str] = None,
         start_utc: Optional[datetime] = None,
         end_utc: Optional[datetime] = None,
         page: int = 1,
         page_size: int = 20,
     ) -> Dict[str, Any]:
-        """Paginated list (newest first). Returns {items, total, page, page_size}."""
+        """Paginated list (oldest first). Returns {items, total, page, page_size}.
+
+        ``user_or_owner`` matches a single value against either ``user_id`` or
+        ``owner_name`` (exact match on either).
+        """
         with session_scope() as session:
             conditions = []
             if api_key:
                 conditions.append(ContentAudit.api_key == api_key)
             if user_id:
                 conditions.append(ContentAudit.user_id == user_id)
+            if user_or_owner:
+                conditions.append(
+                    or_(
+                        ContentAudit.user_id == user_or_owner,
+                        ContentAudit.owner_name == user_or_owner,
+                    )
+                )
             if start_utc:
                 conditions.append(ContentAudit.request_time >= start_utc)
             if end_utc:
@@ -190,7 +202,7 @@ class ContentAuditRepository:
             for c in conditions:
                 stmt = stmt.where(c)
             stmt = (
-                stmt.order_by(ContentAudit.request_time.desc(), ContentAudit.id.desc())
+                stmt.order_by(ContentAudit.request_time.asc(), ContentAudit.id.asc())
                 .offset((page - 1) * page_size)
                 .limit(page_size)
             )

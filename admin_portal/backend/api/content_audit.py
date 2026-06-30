@@ -33,13 +33,14 @@ def _parse_window(start: Optional[str], end: Optional[str], tz_name: str):
 async def list_audit(
     api_key: Optional[str] = Query(default=None),
     user_id: Optional[str] = Query(default=None),
+    user_or_owner: Optional[str] = Query(default=None),
     start: Optional[str] = Query(default=None),
     end: Optional[str] = Query(default=None),
     tz: Optional[str] = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
 ):
-    """Paginated content audit list (newest first), filterable by user/time."""
+    """Paginated content audit list (oldest first), filterable by user/time."""
     _require_mysql()
     tz_name = tz or settings.app_timezone
     start_utc, end_utc = _parse_window(start, end, tz_name)
@@ -49,6 +50,7 @@ async def list_audit(
     result = ContentAuditRepository.list(
         api_key=api_key,
         user_id=user_id,
+        user_or_owner=user_or_owner,
         start_utc=start_utc,
         end_utc=end_utc,
         page=page,
@@ -75,6 +77,7 @@ async def get_audit(record_id: int):
 async def export_markdown(
     api_key: Optional[str] = Query(default=None),
     user_id: Optional[str] = Query(default=None),
+    user_or_owner: Optional[str] = Query(default=None),
     start: Optional[str] = Query(default=None),
     end: Optional[str] = Query(default=None),
     tz: Optional[str] = Query(default=None),
@@ -91,6 +94,7 @@ async def export_markdown(
     result = ContentAuditRepository.list(
         api_key=api_key,
         user_id=user_id,
+        user_or_owner=user_or_owner,
         start_utc=start_utc,
         end_utc=end_utc,
         page=1,

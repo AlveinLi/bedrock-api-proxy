@@ -113,7 +113,7 @@ class ContentAudit(Base):
     request_id: Mapped[str | None] = mapped_column(String(128), index=True)
     api_key: Mapped[str] = mapped_column(String(128), index=True)
     user_id: Mapped[str | None] = mapped_column(String(255), index=True)
-    owner_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    owner_name: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     request_time: Mapped[datetime] = mapped_column(DateTime, index=True)
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     resolved_model: Mapped[str | None] = mapped_column(String(255), nullable=True)

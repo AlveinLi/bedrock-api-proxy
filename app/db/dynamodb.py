@@ -1852,6 +1852,8 @@ class UsageStatsManager:
 
                     # Accumulate tokens that fall on the current local day for
                     # the per-day token limit (timestamp stored in milliseconds).
+                    # Cache read tokens (cached_tokens) are intentionally
+                    # excluded from the daily limit count.
                     try:
                         record_dt = datetime.fromtimestamp(
                             record_timestamp / 1000, tz=timezone.utc
@@ -1860,7 +1862,6 @@ class UsageStatsManager:
                             daily_total_tokens += (
                                 input_tokens
                                 + output_tokens
-                                + cached_tokens
                                 + cache_write_tokens
                             )
                     except (ValueError, OSError, OverflowError):

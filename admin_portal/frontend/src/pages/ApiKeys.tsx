@@ -849,7 +849,7 @@ export default function ApiKeys() {
                             <div className="w-full flex flex-col gap-1.5 min-w-[120px]">
                               <div className="flex justify-between text-xs">
                                 <span className="text-white font-medium">{formatTokens(usedTokens)}</span>
-                                <span className="text-slate-500">/ {limitWan}{t('apiKeys.wan')}</span>
+                                <span className="text-slate-500">/ {formatTokens(limitTokens)}</span>
                               </div>
                               <div className="w-full bg-border-dark h-2 rounded-full overflow-hidden">
                                 <div

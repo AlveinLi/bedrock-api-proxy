@@ -320,6 +320,7 @@ export const contentAuditApi = {
   list: async (params: {
     api_key?: string;
     user_id?: string;
+    user_or_owner?: string;
     start?: string;
     end?: string;
     tz?: string;
@@ -336,6 +337,7 @@ export const contentAuditApi = {
   exportMarkdown: async (params: {
     api_key?: string;
     user_id?: string;
+    user_or_owner?: string;
     start?: string;
     end?: string;
     tz?: string;

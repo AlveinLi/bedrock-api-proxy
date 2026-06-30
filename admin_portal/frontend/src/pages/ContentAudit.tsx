@@ -11,7 +11,7 @@ import TimezoneSelect from '../components/audit/TimezoneSelect';
 export default function ContentAudit() {
   const { t } = useTranslation();
   const [tz, setTz] = useState(getDefaultTimezone());
-  const [userId, setUserId] = useState('');
+  const [userOrOwner, setUserOrOwner] = useState('');
   const [start, setStart] = useState(hoursAgoLocalInput(24));
   const [end, setEnd] = useState(nowLocalInput());
   const [page, setPage] = useState(1);
@@ -20,10 +20,10 @@ export default function ContentAudit() {
   const [exporting, setExporting] = useState(false);
 
   // Applied filters (only update on "search" to avoid spamming)
-  const [applied, setApplied] = useState({ user_id: '', start: start, end: end });
+  const [applied, setApplied] = useState({ user_or_owner: '', start: start, end: end });
 
   const { data, isLoading, error } = useContentAudit({
-    user_id: applied.user_id || undefined,
+    user_or_owner: applied.user_or_owner || undefined,
     start: applied.start || undefined,
     end: applied.end || undefined,
     tz,
@@ -33,14 +33,14 @@ export default function ContentAudit() {
 
   const handleSearch = () => {
     setPage(1);
-    setApplied({ user_id: userId, start, end });
+    setApplied({ user_or_owner: userOrOwner, start, end });
   };
 
   const handleExport = async () => {
     setExporting(true);
     try {
       await contentAuditApi.exportMarkdown({
-        user_id: applied.user_id || undefined,
+        user_or_owner: applied.user_or_owner || undefined,
         start: applied.start || undefined,
         end: applied.end || undefined,
         tz,
@@ -73,12 +73,12 @@ export default function ContentAudit() {
       {/* Filters */}
       <div className="flex flex-wrap items-end gap-4 bg-surface-dark border border-border-dark rounded-xl p-4">
         <div className="flex flex-col gap-1">
-          <label className="text-xs text-slate-400">{t('contentAudit.userId')}</label>
+          <label className="text-xs text-slate-400">{t('contentAudit.userOrOwner')}</label>
           <input
             type="text"
-            value={userId}
-            onChange={(e) => setUserId(e.target.value)}
-            placeholder={t('contentAudit.userIdPlaceholder')}
+            value={userOrOwner}
+            onChange={(e) => setUserOrOwner(e.target.value)}
+            placeholder={t('contentAudit.userOrOwnerPlaceholder')}
             className="px-3 py-2 bg-input-bg border border-border-dark rounded-lg text-white text-sm focus:border-primary focus:ring-1 focus:ring-primary"
           />
         </div>

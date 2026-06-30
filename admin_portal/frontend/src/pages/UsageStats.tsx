@@ -178,7 +178,7 @@ export default function UsageStats() {
                     <Td>{formatTokens(r.total_tokens)}</Td>
                     <Td>{r.requests.toLocaleString()}</Td>
                     <Td>${r.total_cost.toFixed(4)}</Td>
-                    <Td>{r.daily_token_limit > 0 ? `${r.daily_token_limit} ${t('usageStats.wan')}` : '—'}</Td>
+                    <Td>{r.daily_token_limit > 0 ? `${formatTokens(r.daily_token_limit * 10000)}` : '—'}</Td>
                     <Td>{r.monthly_budget > 0 ? `$${r.monthly_budget.toFixed(2)}` : '—'}</Td>
                     <td className="px-4 py-3 whitespace-nowrap text-xs text-slate-300">{r.service_tier}</td>
                   </tr>

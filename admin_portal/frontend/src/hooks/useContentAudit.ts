@@ -4,6 +4,7 @@ import { contentAuditApi, contentAuditHistoryApi } from '../services/api';
 export function useContentAudit(params: {
   api_key?: string;
   user_id?: string;
+  user_or_owner?: string;
   start?: string;
   end?: string;
   tz?: string;
