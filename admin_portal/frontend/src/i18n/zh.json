@@ -407,6 +407,12 @@
     "requestMessages": "请求消息",
     "viewRaw": "查看原文",
     "viewMarkdown": "渲染 Markdown",
+    "viewSummary": "显示摘要",
+    "viewFull": "显示全部",
+    "tokensCombined": "Tokens (in/out/cr/cw/rsn/total)",
+    "duration": "耗时 (ms)",
+    "successField": "成功",
+    "clientIp": "客户端 IP",
     "emptyResponse": "（空响应）"
   },
   "contentAuditHistory": {

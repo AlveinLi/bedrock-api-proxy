@@ -407,6 +407,12 @@
     "requestMessages": "Request Messages",
     "viewRaw": "View Raw",
     "viewMarkdown": "View Markdown",
+    "viewSummary": "Show Summary",
+    "viewFull": "Show Full",
+    "tokensCombined": "Tokens (in/out/cr/cw/rsn/total)",
+    "duration": "Duration (ms)",
+    "successField": "Success",
+    "clientIp": "Client IP",
     "emptyResponse": "(empty response)"
   },
   "contentAuditHistory": {

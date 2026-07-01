@@ -13,6 +13,17 @@ function prettyJson(value?: string | null): string {
   }
 }
 
+/** Parse request_messages; return the array if it is a JSON array, else null. */
+function parseMessageArray(value?: string | null): unknown[] | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Full-content detail modal for a content audit record. Long fields are shown
  * in scrollable blocks; the response can be rendered as markdown.
@@ -28,10 +39,20 @@ export default function AuditDetailModal({
 }) {
   const { t } = useTranslation();
   const [renderMarkdown, setRenderMarkdown] = useState(true);
+  const [requestExpanded, setRequestExpanded] = useState(false);
 
-  const Section = ({ title, children }: { title: string; children: React.ReactNode }) => (
+  const requestArray = parseMessageArray(record.request_messages);
+  const requestDisplay =
+    requestArray && !requestExpanded
+      ? JSON.stringify(requestArray.slice(-2), null, 2)
+      : prettyJson(record.request_messages);
+
+  const Section = ({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) => (
     <div className="flex flex-col gap-2">
-      <h3 className="text-sm font-semibold text-slate-300">{title}</h3>
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold text-slate-300">{title}</h3>
+        {action}
+      </div>
       {children}
     </div>
   );
@@ -59,35 +80,40 @@ export default function AuditDetailModal({
               <div><span className="text-slate-500">{t('contentAudit.serviceTier')}: </span><span className="text-white">{record.service_tier || '-'}</span></div>
               <div><span className="text-slate-500">{t('contentAudit.streaming')}: </span><span className="text-white">{record.streaming ? t('common.yes') : t('common.no')}</span></div>
               <div><span className="text-slate-500">{t('contentAudit.stopReason')}: </span><span className="text-white">{record.stop_reason || '-'}</span></div>
-              <div><span className="text-slate-500">{t('contentAudit.totalTokens')}: </span><span className="text-white">{record.total_tokens}</span></div>
               <div><span className="text-slate-500">{t('contentAudit.cost')}: </span><span className="text-white">${(record.cost || 0).toFixed(6)}</span></div>
+              <div><span className="text-slate-500">{t('contentAudit.duration')}: </span><span className="text-white">{record.duration_ms ?? '-'}</span></div>
+              <div><span className="text-slate-500">{t('contentAudit.successField')}: </span><span className="text-white">{record.success ? t('common.yes') : t('common.no')}</span></div>
+              <div><span className="text-slate-500">{t('contentAudit.clientIp')}: </span><span className="text-white">{record.client_ip || '-'}</span></div>
+              <div className="col-span-2 md:col-span-3"><span className="text-slate-500">{t('contentAudit.tokensCombined')}: </span><span className="text-white">{record.input_tokens}/{record.output_tokens}/{record.cache_read_tokens}/{record.cache_write_tokens}/{record.reasoning_tokens}/{record.total_tokens}</span></div>
             </div>
 
-            {record.system_prompt && (
-              <Section title={t('contentAudit.system')}>
-                <pre className="text-xs bg-black/30 rounded-lg p-3 overflow-x-auto max-h-48 overflow-y-auto text-slate-300 whitespace-pre-wrap">{prettyJson(record.system_prompt)}</pre>
-              </Section>
-            )}
-
-            {record.tools && (
-              <Section title={t('contentAudit.tools')}>
-                <pre className="text-xs bg-black/30 rounded-lg p-3 overflow-x-auto max-h-48 overflow-y-auto text-slate-300 whitespace-pre-wrap">{prettyJson(record.tools)}</pre>
-              </Section>
-            )}
-
-            <Section title={t('contentAudit.requestMessages')}>
-              <pre className="text-xs bg-black/30 rounded-lg p-3 overflow-x-auto max-h-72 overflow-y-auto text-slate-300 whitespace-pre-wrap">{prettyJson(record.request_messages)}</pre>
+            <Section
+              title={t('contentAudit.requestMessages')}
+              action={
+                requestArray ? (
+                  <button
+                    onClick={() => setRequestExpanded((v) => !v)}
+                    className="text-xs px-2 py-1 rounded border border-border-dark text-slate-300 hover:bg-border-dark whitespace-nowrap"
+                  >
+                    {requestExpanded ? t('contentAudit.viewSummary') : t('contentAudit.viewFull')}
+                  </button>
+                ) : undefined
+              }
+            >
+              <pre className="text-xs bg-black/30 rounded-lg p-3 overflow-x-auto max-h-72 overflow-y-auto text-slate-300 whitespace-pre-wrap">{requestDisplay}</pre>
             </Section>
 
-            <Section title={t('contentAudit.response')}>
-              <div className="flex items-center gap-2 mb-1">
+            <Section
+              title={t('contentAudit.response')}
+              action={
                 <button
                   onClick={() => setRenderMarkdown((v) => !v)}
-                  className="text-xs px-2 py-1 rounded border border-border-dark text-slate-300 hover:bg-border-dark"
+                  className="text-xs px-2 py-1 rounded border border-border-dark text-slate-300 hover:bg-border-dark whitespace-nowrap"
                 >
                   {renderMarkdown ? t('contentAudit.viewRaw') : t('contentAudit.viewMarkdown')}
                 </button>
-              </div>
+              }
+            >
               <div className="bg-black/30 rounded-lg p-3 max-h-96 overflow-y-auto">
                 {record.response_content ? (
                   renderMarkdown ? (
@@ -100,6 +126,18 @@ export default function AuditDetailModal({
                 )}
               </div>
             </Section>
+
+            {record.system_prompt && (
+              <Section title={t('contentAudit.system')}>
+                <pre className="text-xs bg-black/30 rounded-lg p-3 overflow-x-auto max-h-48 overflow-y-auto text-slate-300 whitespace-pre-wrap">{prettyJson(record.system_prompt)}</pre>
+              </Section>
+            )}
+
+            {record.tools && (
+              <Section title={t('contentAudit.tools')}>
+                <pre className="text-xs bg-black/30 rounded-lg p-3 overflow-x-auto max-h-48 overflow-y-auto text-slate-300 whitespace-pre-wrap">{prettyJson(record.tools)}</pre>
+              </Section>
+            )}
 
             {record.error_message && (
               <Section title={t('common.error')}>
