@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   usePricing,
@@ -8,6 +8,10 @@ import {
   useDeletePricing,
 } from '../hooks';
 import type { ModelPricing, PricingCreate, PricingUpdate } from '../types';
+
+// Every model is fetched in one request so search and paging cover the full set
+const FETCH_LIMIT = 1000;
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
 
 // Slide-over Panel Component
 function SlideOver({
@@ -287,11 +291,35 @@ export default function Pricing() {
   const [providerFilter, setProviderFilter] = useState<string>('');
   const [showCreatePanel, setShowCreatePanel] = useState(false);
   const [editingPricing, setEditingPricing] = useState<ModelPricing | null>(null);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
 
   const { data, isLoading, error } = usePricing({
+    limit: FETCH_LIMIT,
     provider: providerFilter || undefined,
-    search: search || undefined,
   });
+
+  // Search runs client-side so it covers every model, not just the visible page
+  const filteredPricing = useMemo(() => {
+    const items = data?.items || [];
+    const term = search.trim().toLowerCase();
+    if (!term) return items;
+    return items.filter((pricing) =>
+      [pricing.model_id, pricing.display_name].some((field) =>
+        (field || '').toLowerCase().includes(term)
+      )
+    );
+  }, [data, search]);
+
+  const totalCount = filteredPricing.length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const pageStart = (currentPage - 1) * pageSize;
+  const pagedPricing = filteredPricing.slice(pageStart, pageStart + pageSize);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, providerFilter, pageSize]);
 
   const { data: providersData } = usePricingProviders();
   const createMutation = useCreatePricing();
@@ -448,14 +476,14 @@ export default function Pricing() {
                     </span>
                   </td>
                 </tr>
-              ) : data?.items.length === 0 ? (
+              ) : totalCount === 0 ? (
                 <tr>
                   <td colSpan={7} className="px-6 py-12 text-center text-slate-400">
                     No pricing data found
                   </td>
                 </tr>
               ) : (
-                data?.items.map((pricing) => {
+                pagedPricing.map((pricing) => {
                   const statusInfo = getStatusIcon(pricing.status);
                   const isDeprecated = pricing.status === 'deprecated';
 
@@ -542,25 +570,48 @@ export default function Pricing() {
         </div>
 
         {/* Pagination */}
-        <div className="bg-[#151b26] px-4 py-3 flex items-center justify-between border-t border-border-dark sm:px-6">
-          <div className="hidden sm:flex-1 sm:flex sm:items-center sm:justify-between">
-            <div>
-              <p className="text-sm text-slate-400">
-                {t('common.showing')} <span className="font-medium">1</span> {t('common.of')}{' '}
-                <span className="font-medium">{data?.count || 0}</span> {t('common.entries')}
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                className="px-3 py-1 text-sm text-slate-400 hover:text-white disabled:opacity-50"
-                disabled
+        <div className="bg-[#151b26] px-4 py-3 flex flex-col sm:flex-row items-center justify-between gap-3 border-t border-border-dark sm:px-6">
+          <div className="flex items-center gap-4">
+            <p className="text-sm text-slate-400">
+              {t('common.showing')}{' '}
+              <span className="font-medium">{totalCount === 0 ? 0 : pageStart + 1}</span>-
+              <span className="font-medium">{pageStart + pagedPricing.length}</span>{' '}
+              {t('common.of')} <span className="font-medium">{totalCount}</span>{' '}
+              {t('common.entries')}
+            </p>
+            <label className="flex items-center gap-2 text-sm text-slate-400">
+              {t('common.perPage')}
+              <select
+                value={pageSize}
+                onChange={(e) => setPageSize(Number(e.target.value))}
+                className="px-2 py-1 bg-transparent border border-border-dark rounded-lg text-slate-300 text-sm focus:border-primary focus:ring-0"
               >
-                {t('common.previous')}
-              </button>
-              <button className="px-3 py-1 text-sm text-slate-400 hover:text-white">
-                {t('common.next')}
-              </button>
-            </div>
+                {PAGE_SIZE_OPTIONS.map((size) => (
+                  <option key={size} value={size}>
+                    {size}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage(Math.max(1, currentPage - 1))}
+              disabled={currentPage <= 1}
+              className="px-3 py-1 text-sm text-slate-300 border border-border-dark rounded-lg hover:bg-border-dark disabled:opacity-40 disabled:hover:bg-transparent transition-colors"
+            >
+              {t('common.previous')}
+            </button>
+            <span className="text-sm text-slate-400">
+              {currentPage} / {totalPages}
+            </span>
+            <button
+              onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
+              disabled={currentPage >= totalPages}
+              className="px-3 py-1 text-sm text-slate-300 border border-border-dark rounded-lg hover:bg-border-dark disabled:opacity-40 disabled:hover:bg-transparent transition-colors"
+            >
+              {t('common.next')}
+            </button>
           </div>
         </div>
       </div>

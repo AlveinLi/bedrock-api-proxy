@@ -1662,6 +1662,38 @@ class UsageStatsManager:
         except ClientError:
             return None
 
+    def get_stats_batch(self, api_keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Get aggregated usage stats for many API keys.
+
+        Args:
+            api_keys: API keys to query
+
+        Returns:
+            Mapping of api_key -> usage stats, omitting keys that have no stats
+        """
+        unique_keys = list(dict.fromkeys(key for key in api_keys if key))
+        stats: Dict[str, Dict[str, Any]] = {}
+        table_name = self.table.name
+
+        # batch_get_item accepts at most 100 keys per call
+        for start in range(0, len(unique_keys), 100):
+            chunk = unique_keys[start:start + 100]
+            try:
+                request = {table_name: {"Keys": [{"api_key": k} for k in chunk]}}
+                while request:
+                    response = self.dynamodb.batch_get_item(RequestItems=request)
+                    for item in response.get("Responses", {}).get(table_name, []):
+                        stats[item["api_key"]] = item
+                    request = response.get("UnprocessedKeys") or {}
+            except ClientError:
+                for key in chunk:
+                    item = self.get_stats(key)
+                    if item:
+                        stats[key] = item
+
+        return stats
+
     def update_stats(
         self,
         api_key: str,

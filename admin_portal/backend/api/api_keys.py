@@ -1,7 +1,7 @@
 """API Keys management routes."""
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
@@ -18,6 +18,10 @@ from admin_portal.backend.schemas.api_key import (
 
 router = APIRouter()
 
+# DynamoDB applies a scan's Limit before FilterExpression, so a single scan page
+# can return fewer rows than requested. Scan in pages until `limit` is satisfied.
+_SCAN_PAGE_SIZE = 100
+
 
 def get_managers():
     """Get DynamoDB managers."""
@@ -27,7 +31,7 @@ def get_managers():
 
 @router.get("", response_model=ApiKeyListResponse)
 async def list_api_keys(
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=1000, ge=1, le=5000),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     search: Optional[str] = Query(default=None),
 ):
@@ -35,18 +39,26 @@ async def list_api_keys(
     List all API keys with pagination and filtering.
 
     Args:
-        limit: Maximum number of items to return (1-100)
+        limit: Maximum number of items to return (1-5000)
         status_filter: Filter by status ('active', 'revoked', or None for all)
         search: Search term for filtering by name or key prefix
     """
     api_key_manager, _, usage_stats_manager = get_managers()
 
-    result = api_key_manager.list_all_api_keys(
-        limit=limit,
-        status_filter=status_filter,
-    )
+    items: List[Dict[str, Any]] = []
+    last_key: Optional[Dict[str, Any]] = None
+    while len(items) < limit:
+        result = api_key_manager.list_all_api_keys(
+            limit=_SCAN_PAGE_SIZE,
+            last_key=last_key,
+            status_filter=status_filter,
+        )
+        items.extend(result.get("items", []))
+        last_key = result.get("last_key")
+        if not last_key:
+            break
 
-    items = result.get("items", [])
+    items = items[:limit]
 
     # Apply search filter if provided
     if search:
@@ -60,8 +72,11 @@ async def list_api_keys(
         ]
 
     # Add usage stats to each item
+    stats_by_key = usage_stats_manager.get_stats_batch(
+        [item.get("api_key", "") for item in items]
+    )
     for item in items:
-        stats = usage_stats_manager.get_stats(item.get("api_key", ""))
+        stats = stats_by_key.get(item.get("api_key", ""))
         if stats:
             item["total_input_tokens"] = int(stats.get("total_input_tokens", 0))
             item["total_output_tokens"] = int(stats.get("total_output_tokens", 0))
@@ -78,7 +93,7 @@ async def list_api_keys(
     return ApiKeyListResponse(
         items=[ApiKeyResponse(**item) for item in items],
         count=len(items),
-        last_key=result.get("last_key"),
+        last_key=last_key,
     )
 
 

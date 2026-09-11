@@ -1,7 +1,7 @@
 """Model Pricing management routes."""
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
@@ -17,6 +17,10 @@ from admin_portal.backend.schemas.pricing import (
 
 router = APIRouter()
 
+# DynamoDB applies a scan's Limit before FilterExpression, so a single scan page
+# can return fewer rows than requested. Scan in pages until `limit` is satisfied.
+_SCAN_PAGE_SIZE = 100
+
 
 def get_manager():
     """Get ModelPricingManager instance."""
@@ -24,9 +28,39 @@ def get_manager():
     return ModelPricingManager(db_client)
 
 
+def _scan_pricing(
+    pricing_manager: ModelPricingManager,
+    limit: int,
+    provider_filter: Optional[str] = None,
+    status_filter: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Read pricing rows across scan pages until `limit` rows are collected.
+
+    Returns:
+        Tuple of (items, last_key). `last_key` is None once the table is exhausted.
+    """
+    items: List[Dict[str, Any]] = []
+    last_key: Optional[Dict[str, Any]] = None
+
+    while len(items) < limit:
+        result = pricing_manager.list_all_pricing(
+            limit=_SCAN_PAGE_SIZE,
+            last_key=last_key,
+            provider_filter=provider_filter,
+            status_filter=status_filter,
+        )
+        items.extend(result.get("items", []))
+        last_key = result.get("last_key")
+        if not last_key:
+            break
+
+    return items[:limit], last_key
+
+
 @router.get("", response_model=PricingListResponse)
 async def list_pricing(
-    limit: int = Query(default=50, ge=1, le=100),
+    limit: int = Query(default=1000, ge=1, le=5000),
     provider: Optional[str] = Query(default=None),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     search: Optional[str] = Query(default=None),
@@ -35,20 +69,19 @@ async def list_pricing(
     List all model pricing with pagination and filtering.
 
     Args:
-        limit: Maximum number of items to return (1-100)
+        limit: Maximum number of items to return (1-5000)
         provider: Filter by provider name
         status_filter: Filter by status ('active', 'deprecated', 'disabled')
         search: Search term for filtering by model ID
     """
     pricing_manager = get_manager()
 
-    result = pricing_manager.list_all_pricing(
+    items, last_key = _scan_pricing(
+        pricing_manager,
         limit=limit,
         provider_filter=provider,
         status_filter=status_filter,
     )
-
-    items = result.get("items", [])
 
     # Apply search filter if provided
     if search:
@@ -62,7 +95,7 @@ async def list_pricing(
     return PricingListResponse(
         items=[PricingResponse(**item) for item in items],
         count=len(items),
-        last_key=result.get("last_key"),
+        last_key=last_key,
     )
 
 
@@ -73,8 +106,7 @@ async def list_providers():
     """
     pricing_manager = get_manager()
 
-    result = pricing_manager.list_all_pricing(limit=1000)
-    items = result.get("items", [])
+    items, _ = _scan_pricing(pricing_manager, limit=5000)
 
     providers = list(set(item.get("provider", "Unknown") for item in items))
     providers.sort()

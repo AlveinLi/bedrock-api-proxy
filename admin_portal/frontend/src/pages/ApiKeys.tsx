@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   useApiKeys,
@@ -13,6 +13,10 @@ import {
 } from '../hooks';
 import type { ApiKey, ApiKeyCreate, ApiKeyUpdate } from '../types';
 import { formatTokens, cacheHitRate, formatCacheHitRate } from '../utils';
+
+// Every key is fetched in one request so search and paging cover the full set
+const FETCH_LIMIT = 1000;
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
 
 // Modal Component
 function Modal({
@@ -271,11 +275,35 @@ export default function ApiKeys() {
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editingKey, setEditingKey] = useState<ApiKey | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
 
   const { data, isLoading, error } = useApiKeys({
+    limit: FETCH_LIMIT,
     status: statusFilter || undefined,
-    search: search || undefined,
   });
+
+  // Search runs client-side so it covers every key, not just the visible page
+  const filteredKeys = useMemo(() => {
+    const items = data?.items || [];
+    const term = search.trim().toLowerCase();
+    if (!term) return items;
+    return items.filter((key) =>
+      [key.name, key.api_key, key.owner_name, key.user_id].some((field) =>
+        (field || '').toLowerCase().includes(term)
+      )
+    );
+  }, [data, search]);
+
+  const totalCount = filteredKeys.length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const pageStart = (currentPage - 1) * pageSize;
+  const pagedKeys = filteredKeys.slice(pageStart, pageStart + pageSize);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, statusFilter, pageSize]);
 
   const { data: stats } = useDashboardStats();
   const { data: providersData } = useProviders();
@@ -325,7 +353,7 @@ export default function ApiKeys() {
   };
 
   const handleExport = useCallback(() => {
-    const apiKeys = data?.items || [];
+    const apiKeys = filteredKeys;
     if (apiKeys.length === 0) {
       alert('No data to export');
       return;
@@ -387,7 +415,7 @@ export default function ApiKeys() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-  }, [data]);
+  }, [filteredKeys]);
 
   const copyToClipboard = useCallback(async (text: string) => {
     try {
@@ -675,14 +703,14 @@ export default function ApiKeys() {
                     </span>
                   </td>
                 </tr>
-              ) : data?.items.length === 0 ? (
+              ) : totalCount === 0 ? (
                 <tr>
                   <td colSpan={12} className="px-6 py-12 text-center text-slate-400">
                     No API keys found
                   </td>
                 </tr>
               ) : (
-                data?.items.map((key) => {
+                pagedKeys.map((key) => {
                   // Use budget_used_mtd for comparison with monthly_budget
                   const mtdBudget = key.budget_used_mtd ?? key.budget_used ?? 0;
                   const usedPercent = key.monthly_budget
@@ -999,18 +1027,43 @@ export default function ApiKeys() {
         </div>
 
         {/* Pagination */}
-        <div className="flex items-center justify-between px-6 py-4 border-t border-border-dark bg-[#151b28]">
-          <span className="text-sm text-slate-400">
-            {t('common.showing')} 1 {t('common.of')} {data?.count || 0} {t('common.entries')}
-          </span>
+        <div className="flex flex-col sm:flex-row items-center justify-between gap-3 px-6 py-4 border-t border-border-dark bg-[#151b28]">
+          <div className="flex items-center gap-4">
+            <span className="text-sm text-slate-400">
+              {t('common.showing')} {totalCount === 0 ? 0 : pageStart + 1}-
+              {pageStart + pagedKeys.length} {t('common.of')} {totalCount} {t('common.entries')}
+            </span>
+            <label className="flex items-center gap-2 text-sm text-slate-400">
+              {t('common.perPage')}
+              <select
+                value={pageSize}
+                onChange={(e) => setPageSize(Number(e.target.value))}
+                className="px-2 py-1 bg-transparent border border-border-dark rounded-lg text-slate-300 text-sm focus:border-primary focus:ring-0"
+              >
+                {PAGE_SIZE_OPTIONS.map((size) => (
+                  <option key={size} value={size}>
+                    {size}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
           <div className="flex items-center gap-2">
             <button
-              className="px-3 py-1 text-sm text-slate-400 hover:text-white disabled:opacity-50"
-              disabled
+              onClick={() => setPage(Math.max(1, currentPage - 1))}
+              disabled={currentPage <= 1}
+              className="px-3 py-1 text-sm text-slate-300 border border-border-dark rounded-lg hover:bg-border-dark disabled:opacity-40 disabled:hover:bg-transparent transition-colors"
             >
               {t('common.previous')}
             </button>
-            <button className="px-3 py-1 text-sm text-slate-400 hover:text-white">
+            <span className="text-sm text-slate-400">
+              {currentPage} / {totalPages}
+            </span>
+            <button
+              onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
+              disabled={currentPage >= totalPages}
+              className="px-3 py-1 text-sm text-slate-300 border border-border-dark rounded-lg hover:bg-border-dark disabled:opacity-40 disabled:hover:bg-transparent transition-colors"
+            >
               {t('common.next')}
             </button>
           </div>
