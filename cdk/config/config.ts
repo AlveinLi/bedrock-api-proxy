@@ -511,7 +511,6 @@ export function getConfig(environmentName: string = 'dev'): EnvironmentConfig {
     ? process.env.CONTENT_AUDIT_ENABLED.toLowerCase() === 'true'
     : config.contentAuditEnabled;
 
-  return {
   const resolved: EnvironmentConfig = {
     ...config,
     enableBedrockResponses: process.env.ENABLE_BEDROCK_RESPONSES
