@@ -17,6 +17,10 @@ def mock_settings(monkeypatch, web_search_enabled):
     """Set the env so the passthrough router mounts and points at a fake mantle."""
     monkeypatch.setattr("app.core.config.settings.enable_openai_passthrough", True)
     monkeypatch.setattr("app.core.config.settings.openai_api_key", "bedrock-key-test")
+    monkeypatch.setattr("app.core.config.settings.enable_bedrock_responses", True)
+    monkeypatch.setattr("app.core.config.settings.aws_region", "us-east-1")
+    monkeypatch.setattr("app.core.config.settings.bedrock_endpoint_url", None)
+    monkeypatch.setattr("app.core.config.settings.default_model_mapping", {})
     monkeypatch.setattr(
         "app.core.config.settings.openai_base_url", "https://mantle.test/v1"
     )
@@ -55,7 +59,10 @@ def mock_model_mapping_manager():
 
 @pytest.fixture
 def mock_usage_tracker():
-    tracker = MagicMock()
+    from app.db.dynamodb import UsageTracker
+
+    # spec= so assertions fail if the real method is renamed or removed
+    tracker = MagicMock(spec=UsageTracker)
     with patch("app.api.openai_passthrough.router.UsageTracker", return_value=tracker):
         yield tracker
 
@@ -124,9 +131,13 @@ def client(
     import importlib
 
     # Reset httpx singleton so it picks up the patched base URL
+    from app.api.openai_passthrough.chat_responses_adapter import (
+        reset_unsupported_param_cache_for_testing,
+    )
     from app.api.openai_passthrough.client import reset_client_for_testing
 
     reset_client_for_testing()
+    reset_unsupported_param_cache_for_testing()
 
     # Access the actual router MODULE (not the APIRouter instance) via sys.modules.
     # We must do this because app/api/openai_passthrough/__init__.py shadows the

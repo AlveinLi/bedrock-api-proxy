@@ -3,11 +3,45 @@ Application configuration management using Pydantic Settings.
 
 Loads configuration from environment variables with validation and type safety.
 """
+import json
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Offline snapshot of the default model mapping: the ``model-mappings`` git
+# submodule (github.com/xiehust/bedrock-api-proxy-model-mappings) checked out at
+# the repo root. Run ``git submodule update --init`` after cloning.
+BUNDLED_MODEL_MAPPING_PATH = (
+    Path(__file__).resolve().parents[2] / "model-mappings" / "model_mappings.json"
+)
+
+
+@lru_cache(maxsize=1)
+def load_bundled_model_mapping() -> Dict[str, str]:
+    """
+    Load the offline snapshot of the default model mapping.
+
+    Reads ``model-mappings/model_mappings.json`` from the git submodule — the
+    same file the sync service later pulls from GitHub. It seeds
+    ``settings.default_model_mapping`` so the proxy has a working mapping
+    before the first remote sync succeeds (or when sync is disabled). Returns
+    an empty dict if the submodule is not checked out.
+    """
+    try:
+        with BUNDLED_MODEL_MAPPING_PATH.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    mappings = payload.get("mappings", payload) if isinstance(payload, dict) else {}
+    return {
+        str(k): str(v)
+        for k, v in mappings.items()
+        if isinstance(k, str) and isinstance(v, str) and k and v
+    }
 
 
 class Settings(BaseSettings):
@@ -127,10 +161,19 @@ class Settings(BaseSettings):
         default="anthropic-proxy-response-context",
         alias="DYNAMODB_RESPONSE_CONTEXT_TABLE",
     )
+    dynamodb_speed_tests_table: str = Field(
+        default="anthropic-proxy-speed-tests",
+        alias="DYNAMODB_SPEED_TESTS_TABLE",
+        description="Admin portal model speed-test results (TTFT/OTPS history)",
+    )
     usage_ttl_days: int = Field(
-        default=7,
+        default=30,
         alias="USAGE_TTL_DAYS",
-        description="TTL in days for usage records in DynamoDB (0 to disable TTL)"
+        description=(
+            "TTL in days for usage records in DynamoDB (0 to disable TTL). "
+            "Caps how far back the daily-usage dashboard can show; keep >= the "
+            "max dashboard window (30)."
+        )
     )
     response_context_ttl_seconds: int = Field(
         default=3600,
@@ -157,6 +200,15 @@ class Settings(BaseSettings):
     api_key_header: str = Field(default="x-api-key", alias="API_KEY_HEADER")
     require_api_key: bool = Field(default=True, alias="REQUIRE_API_KEY")
     master_api_key: Optional[str] = Field(default=None, alias="MASTER_API_KEY")
+    api_key_cache_ttl_seconds: int = Field(
+        default=60, alias="API_KEY_CACHE_TTL_SECONDS",
+        description=(
+            "TTL in seconds for the in-process API key validation cache "
+            "(0 to disable). Avoids a DynamoDB read per request; key "
+            "changes (create/disable) made in another process take up to "
+            "this long to apply on running workers."
+        )
+    )
 
     # Rate Limiting Settings
     rate_limit_enabled: bool = Field(default=True, alias="RATE_LIMIT_ENABLED")
@@ -197,36 +249,70 @@ class Settings(BaseSettings):
     )
 
     # Model Mapping
+    # Default Anthropic model ID -> Bedrock model ID mappings.
+    #
+    # Source of truth is the remote JSON pulled by
+    # app/services/model_mapping_sync_service.py (MODEL_MAPPING_SYNC_URL, repo
+    # github.com/xiehust/bedrock-api-proxy-model-mappings). The value here is
+    # seeded from the pinned snapshot in the model-mappings/ git submodule so
+    # the proxy works offline / before the first sync, and is replaced
+    # in-process by the sync service once the remote file has been fetched.
+    #
+    # Setting DEFAULT_MODEL_MAPPING (JSON) adds per-deployment entries that are
+    # layered on top of the remote mappings (and replace the bundled snapshot
+    # when sync is disabled).
     default_model_mapping: Dict[str, str] = Field(
-        default={
-            # Anthropic model IDs -> Bedrock model ARNs
-            "claude-fable-5": "global.anthropic.claude-fable-5",
-            "claude-opus-4-8": "global.anthropic.claude-opus-4-8",
-            "claude-opus-4-7": "global.anthropic.claude-opus-4-7",
-            "claude-sonnet-4-6": "global.anthropic.claude-sonnet-4-6",
-            "claude-opus-4-6": "global.anthropic.claude-opus-4-6-v1",
-            "claude-opus-4-5-20251101": "global.anthropic.claude-opus-4-5-20251101-v1:0",
-            "claude-sonnet-4-5-20250929": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-            "claude-haiku-4-5-20251001": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
-            "claude-3-5-haiku-20241022": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
-            # 1M-context aliases — same Bedrock target; the 1M window is
-            # activated by the `anthropic-beta: context-1m-2025-08-07` header
-            # that clients (e.g. Claude Code) attach to the request.
-            "claude-fable-5-us": "us.anthropic.claude-fable-5",
-            "claude-fable-5-us[1m]": "us.anthropic.claude-fable-5",
-            "claude-fable-5[1m]": "global.anthropic.claude-fable-5",
-            "claude-opus-4-8[1m]": "global.anthropic.claude-opus-4-8",
-            "claude-opus-4-7[1m]": "global.anthropic.claude-opus-4-7",
-            "claude-opus-4-6[1m]": "global.anthropic.claude-opus-4-6-v1",
-            "claude-sonnet-4-6[1m]": "global.anthropic.claude-sonnet-4-6",
-            # Non-Claude Bedrock models (identity-mapped).
-            "minimax.minimax-m2.5": "minimax.minimax-m2.5",
-            "zai.glm-5": "zai.glm-5",
-            "moonshotai.kimi-k2.5": "moonshotai.kimi-k2.5",
-            "gpt-5.5": "openai.gpt-5.5",
-            "gpt-5.4": "openai.gpt-5.4",
-        },
+        default_factory=lambda: dict(load_bundled_model_mapping()),
         alias="DEFAULT_MODEL_MAPPING",
+    )
+
+    # Model Mapping Sync (remote JSON)
+    model_mapping_sync_enabled: bool = Field(
+        default=True,
+        alias="MODEL_MAPPING_SYNC_ENABLED",
+        description="Pull default model mappings from MODEL_MAPPING_SYNC_URL at "
+                    "startup and periodically; when disabled only the bundled "
+                    "snapshot / DEFAULT_MODEL_MAPPING env var are used.",
+    )
+    model_mapping_sync_url: str = Field(
+        default=(
+            "https://raw.githubusercontent.com/xiehust/"
+            "bedrock-api-proxy-model-mappings/main/model_mappings.json"
+        ),
+        alias="MODEL_MAPPING_SYNC_URL",
+        description="URL of the model_mappings.json to pull default mappings from",
+    )
+    model_mapping_sync_interval_seconds: int = Field(
+        default=3600,
+        alias="MODEL_MAPPING_SYNC_INTERVAL_SECONDS",
+        description="Interval between automatic model mapping refreshes, in seconds",
+    )
+    model_mapping_sync_timeout_seconds: float = Field(
+        default=15.0,
+        alias="MODEL_MAPPING_SYNC_TIMEOUT_SECONDS",
+        description="HTTP timeout for fetching the remote model mapping file",
+    )
+
+    # Admin portal model speed test (runs through the proxy's /v1/messages)
+    proxy_base_url: str = Field(
+        default="http://localhost:8000",
+        alias="PROXY_BASE_URL",
+        description="Base URL of the proxy the admin portal calls for model speed "
+                    "tests (behind CloudFront use the https:// distribution URL)",
+    )
+    speed_test_max_tokens: int = Field(
+        default=600,
+        alias="SPEED_TEST_MAX_TOKENS",
+        description=(
+            "max_tokens sent with each speed-test request. Must leave room for "
+            "hidden reasoning (gpt-5.x on Mantle counts it in output_tokens but "
+            "does not stream it) plus the ~200-token prose answer."
+        ),
+    )
+    speed_test_timeout_seconds: int = Field(
+        default=90,
+        alias="SPEED_TEST_TIMEOUT_SECONDS",
+        description="Hard timeout for a single speed-test run, in seconds",
     )
 
     # Streaming Settings
@@ -317,6 +403,15 @@ class Settings(BaseSettings):
         alias="INFERENCE_PROFILE_CACHE_TTL_SECONDS",
         description="TTL (seconds) for the in-memory cache mapping application "
                     "inference profile ARNs to their underlying foundation model ID.",
+    )
+
+    # Model Mapping Cache
+    model_mapping_cache_ttl_seconds: int = Field(
+        default=300,
+        alias="MODEL_MAPPING_CACHE_TTL_SECONDS",
+        description="TTL (seconds) for the in-process model mapping cache "
+                    "(0 to disable). Mapping changes made in another process "
+                    "(e.g. the admin portal) take up to this long to apply.",
     )
 
     # Beta features that require InvokeModel API instead of Converse API
@@ -471,7 +566,15 @@ class Settings(BaseSettings):
         description="Maximum bytes to download per image URL (Bedrock applies its own stricter limits downstream)"
     )
 
-    # === OpenAI-Compatible API Settings (Bedrock Mantle) ===
+    # === OpenAI-Compatible API Settings (Bedrock Runtime and Mantle) ===
+    enable_bedrock_responses: bool = Field(
+        default=True,
+        alias="ENABLE_BEDROCK_RESPONSES",
+        description=(
+            "Default scoped non-Claude model IDs (global., us., eu., etc.) "
+            "to Bedrock Runtime Responses, independently of ENABLE_OPENAI_COMPAT"
+        ),
+    )
     # When enabled, non-Claude models use OpenAI Chat Completions API via bedrock-mantle
     # instead of Bedrock Converse API. Claude models still use InvokeModel API.
     enable_openai_compat: bool = Field(
@@ -483,7 +586,7 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("BEDROCK_API_KEY", "OPENAI_API_KEY"),
         description=(
-            "Bedrock API key for Bedrock Mantle endpoint. "
+            "Bedrock API key for Runtime and Mantle endpoints. "
             "OPENAI_API_KEY is accepted as a deprecated fallback."
         )
     )
@@ -491,9 +594,9 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("MANTLE_ENDPOINT_URL", "OPENAI_BASE_URL"),
         description=(
-            "Bedrock Mantle endpoint URL "
-            "(e.g. https://bedrock-mantle.us-east-1.api.aws/v1). "
-            "OPENAI_BASE_URL is accepted as a deprecated fallback."
+            "Bedrock OpenAI endpoint URL, including Runtime /openai/v1. "
+            "Scoped non-Claude IDs default to Runtime. "
+            "OPENAI_BASE_URL is also accepted; MANTLE_ENDPOINT_URL takes precedence."
         )
     )
     openai_compat_thinking_high_threshold: int = Field(
@@ -510,6 +613,37 @@ class Settings(BaseSettings):
         default=False,
         alias="ENABLE_OPENAI_PASSTHROUGH",
         description="Mount /openai/v1/* endpoints (Chat Completions + Responses passthrough to bedrock-mantle)"
+    )
+
+    # === Model Pricing Sync (LiteLLM) ===
+    pricing_sync_enabled: bool = Field(
+        default=False, alias="PRICING_SYNC_ENABLED",
+        description="Periodically sync model pricing from the LiteLLM price table (background task in the admin portal)"
+    )
+    pricing_sync_url: str = Field(
+        default=(
+            "https://raw.githubusercontent.com/BerriAI/litellm/"
+            "litellm_internal_staging/model_prices_and_context_window.json"
+        ),
+        alias="PRICING_SYNC_URL",
+        description="URL of the LiteLLM model_prices_and_context_window.json to sync from"
+    )
+    pricing_sync_interval_hours: float = Field(
+        default=24.0, alias="PRICING_SYNC_INTERVAL_HOURS",
+        description="Interval between automatic pricing syncs, in hours"
+    )
+    pricing_sync_providers: List[str] = Field(
+        default=["bedrock", "bedrock_converse", "bedrock_mantle"],
+        alias="PRICING_SYNC_PROVIDERS",
+        description="litellm_provider values to import pricing for"
+    )
+    pricing_sync_create_missing: bool = Field(
+        default=True, alias="PRICING_SYNC_CREATE_MISSING",
+        description="Create pricing rows for source models missing from the table (otherwise only update existing rows)"
+    )
+    pricing_sync_overwrite_manual: bool = Field(
+        default=False, alias="PRICING_SYNC_OVERWRITE_MANUAL",
+        description="Allow sync to overwrite pricing rows that were not created by the sync"
     )
 
     # === Multi-Provider Gateway Feature Flags ===
@@ -625,7 +759,7 @@ class Settings(BaseSettings):
         description="Max in-memory queue size for async content audit writes",
     )
 
-    @field_validator("cors_origins", "cors_allow_methods", "cors_allow_headers", mode="before")
+    @field_validator("cors_origins", "cors_allow_methods", "cors_allow_headers", "pricing_sync_providers", mode="before")
     @classmethod
     def parse_list_fields(cls, v: Any) -> List[str]:
         """Parse list fields from comma-separated string or return as-is."""

@@ -49,6 +49,16 @@ const DEFAULT_PRICING = [
     status: 'active',
   },
   {
+    model_id: 'global.anthropic.claude-opus-5',
+    provider: 'Anthropic',
+    display_name: 'Claude Opus 5',
+    input_price: '5.00',
+    output_price: '25.00',
+    cache_read_price: '0.50',
+    cache_write_price: '6.25',
+    status: 'active',
+  },
+  {
     model_id: 'global.anthropic.claude-opus-4-7',
     provider: 'Anthropic',
     display_name: 'Claude Opus 4.7',
@@ -56,6 +66,16 @@ const DEFAULT_PRICING = [
     output_price: '25.00',
     cache_read_price: '0.50',
     cache_write_price: '6.25',
+    status: 'active',
+  },
+  {
+    model_id: 'global.anthropic.claude-sonnet-5',
+    provider: 'Anthropic',
+    display_name: 'Claude Sonnet 5',
+    input_price: '3.00',
+    output_price: '15.00',
+    cache_read_price: '0.30',
+    cache_write_price: '3.75',
     status: 'active',
   },
   {
@@ -252,6 +272,7 @@ export class DynamoDBStack extends cdk.Stack {
   public readonly providersTable: dynamodb.Table;
   public readonly betaHeadersTable: dynamodb.Table;
   public readonly responseContextTable: dynamodb.Table;
+  public readonly speedTestsTable: dynamodb.Table;
 
   constructor(scope: Construct, id: string, props: DynamoDBStackProps) {
     super(scope, id, props);
@@ -511,6 +532,27 @@ export class DynamoDBStack extends cdk.Stack {
       timeToLiveAttribute: 'expires_at',
     });
 
+    // Speed Tests Table (admin portal model speed-test history: TTFT/OTPS per Bedrock model ID)
+    this.speedTestsTable = new dynamodb.Table(this, 'SpeedTestsTable', {
+      partitionKey: {
+        name: 'bedrock_model_id',
+        type: dynamodb.AttributeType.STRING,
+      },
+      sortKey: {
+        name: 'tested_at',
+        type: dynamodb.AttributeType.NUMBER,
+      },
+      billingMode:
+        config.dynamodbBillingMode === 'PAY_PER_REQUEST'
+          ? dynamodb.BillingMode.PAY_PER_REQUEST
+          : dynamodb.BillingMode.PROVISIONED,
+      readCapacity: config.dynamodbReadCapacity,
+      writeCapacity: config.dynamodbWriteCapacity,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      timeToLiveAttribute: 'expires_at',
+    });
+
     // Apply tags to all tables
     Object.entries(config.tags).forEach(([key, value]) => {
       cdk.Tags.of(this.apiKeysTable).add(key, value);
@@ -525,6 +567,7 @@ export class DynamoDBStack extends cdk.Stack {
       cdk.Tags.of(this.providersTable).add(key, value);
       cdk.Tags.of(this.betaHeadersTable).add(key, value);
       cdk.Tags.of(this.responseContextTable).add(key, value);
+      cdk.Tags.of(this.speedTestsTable).add(key, value);
     });
 
     // Outputs - exportName omitted to avoid cross-stack conflicts
@@ -586,6 +629,11 @@ export class DynamoDBStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'ResponseContextTableName', {
       value: this.responseContextTable.tableName,
       description: 'OpenAI Responses Context DynamoDB Table Name',
+    });
+
+    new cdk.CfnOutput(this, 'SpeedTestsTableName', {
+      value: this.speedTestsTable.tableName,
+      description: 'Model Speed Tests DynamoDB Table Name',
     });
   }
 

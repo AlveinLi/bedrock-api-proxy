@@ -467,9 +467,145 @@ In production (ECS), the admin portal frontend is served as static files from th
 
 ---
 
+## Model Pricing Sync (LiteLLM)
+
+Pulls model pricing from the [LiteLLM price table](https://github.com/BerriAI/litellm/blob/litellm_internal_staging/model_prices_and_context_window.json) into the `anthropic-proxy-model-pricing` DynamoDB table, replacing manual per-model price entry.
+
+### How it works
+
+- Core logic: `app/services/pricing_sync_service.py`. Fetches the JSON (URL configurable via `PRICING_SYNC_URL`), keeps entries whose `litellm_provider` is in `PRICING_SYNC_PROVIDERS` (default `bedrock,bedrock_converse,bedrock_mantle`) and whose `mode` is chat/responses, and converts per-token costs to the table's USD-per-1M-tokens unit (input/output/cache read/cache write).
+- LiteLLM keys are used as Bedrock model IDs as-is, including region-prefixed variants (`us.`, `eu.`, `global.`, ...). `bedrock_mantle/<id>` keys are stripped to `<id>` (the model ID the OpenAI passthrough uses); other keys containing `/` are LiteLLM aliases and skipped.
+- Existing rows whose exact ID isn't in the source (e.g. a `global.` variant LiteLLM doesn't list) are matched by stripping the region prefix, then trying the `us.` variant. Model-mapping targets (`DEFAULT_MODEL_MAPPING` + the mapping table) get pricing rows created the same way, so cost tracking works for the IDs the proxy actually resolves to.
+- **Manual rows are safe by default**: rows created by the sync carry `pricing_source="litellm"` and are refreshed on later runs; rows without the marker (created manually, or price-edited in the admin portal — editing clears the marker) are skipped unless `PRICING_SYNC_OVERWRITE_MANUAL=True` / `overwrite_manual: true`. Rows are never deleted.
+
+### Triggers
+
+| Trigger | How |
+|---|---|
+| Periodic | Background task in the admin portal backend (`admin_portal/backend/services/pricing_sync.py`); enable with `PRICING_SYNC_ENABLED=True`, interval via `PRICING_SYNC_INTERVAL_HOURS` (default 24) |
+| Manual (API) | `POST /api/pricing/sync` on the admin portal — body (optional): `{"url", "create_missing", "overwrite_manual", "dry_run"}` |
+| Manual (CLI) | `uv run python scripts/sync_model_pricing.py [--dry-run] [--overwrite-manual] [--no-create-missing] [--url ...]` |
+
+All three return/print a summary: `created`, `updated`, `unchanged`, `skipped_manual`, `not_found` (mapped models the source has no pricing for). Use `dry_run` to preview before the first real sync.
+
+### Configuration
+
+```bash
+PRICING_SYNC_ENABLED=False            # periodic sync in the admin portal
+PRICING_SYNC_URL=https://raw.githubusercontent.com/BerriAI/litellm/litellm_internal_staging/model_prices_and_context_window.json
+PRICING_SYNC_INTERVAL_HOURS=24
+PRICING_SYNC_PROVIDERS=bedrock,bedrock_converse,bedrock_mantle
+PRICING_SYNC_CREATE_MISSING=True      # create rows for source models not in the table
+PRICING_SYNC_OVERWRITE_MANUAL=False   # never overwrite manual rows unless True
+```
+
+---
+
+## Remote Default Model Mapping Sync
+
+Default Anthropic → Bedrock model ID mappings live in the [`bedrock-api-proxy-model-mappings`](https://github.com/xiehust/bedrock-api-proxy-model-mappings) repo (`model_mappings.json`) instead of `app/core/config.py`, so a new model can be enabled across all deployments by pushing to that repo.
+
+### How it works
+
+- Core logic: `app/services/model_mapping_sync_service.py`. `run_sync()` fetches `MODEL_MAPPING_SYNC_URL`, validates the payload (`{"schema_version": 1, "mappings": {id: bedrock_id}}`; a flat object is also accepted), layers `DEFAULT_MODEL_MAPPING` env entries on top, and atomically replaces `settings.default_model_mapping`. Every reader (`AnthropicToBedrockConverter`, `BedrockProvider.supports_model`, `list_available_models`, admin portal, pricing sync) goes through that attribute, so the refresh is visible immediately.
+- **Offline snapshot**: the same repo is checked out as the `model-mappings/` git submodule; `load_bundled_model_mapping()` in `app/core/config.py` seeds the default mapping from `model-mappings/model_mappings.json` at import time, so unit tests and a proxy without network still resolve models. Both Dockerfiles copy that single file into the image — run `git submodule update --init` before building.
+- **Failure handling**: HTTP errors, invalid JSON, non-string entries or an empty `mappings` object raise and are recorded in the sync status; the previously active mapping is kept. A bad commit in the mappings repo therefore never blanks the proxy's mapping.
+- **Layering** (highest priority first): DynamoDB mapping table (per-deployment overrides via the admin portal, resolved at request time by `ModelMappingManager`) → `DEFAULT_MODEL_MAPPING` env entries → remote file → submodule snapshot → pass-through.
+
+### Triggers
+
+| Trigger | How |
+|---|---|
+| Startup | `start_model_mapping_sync()` in both `app/main.py` and `admin_portal/backend/main.py` lifespans runs one sync (bounded by `MODEL_MAPPING_SYNC_TIMEOUT_SECONDS`) before serving; on failure the snapshot stays active |
+| Periodic | Same scheduler, every `MODEL_MAPPING_SYNC_INTERVAL_SECONDS` (default 3600), independently in each proxy worker and in the admin portal |
+| Manual | Admin portal → Model Mapping → **Refresh defaults**; `POST /api/model-mapping/sync` (`dry_run`, `url` optional); `GET /api/model-mapping/sync/status`; `scripts/sync_model_mappings.py` (`--validate <file>` checks a local edit) |
+
+### Configuration
+
+```bash
+MODEL_MAPPING_SYNC_ENABLED=True
+MODEL_MAPPING_SYNC_URL=https://raw.githubusercontent.com/xiehust/bedrock-api-proxy-model-mappings/main/model_mappings.json
+MODEL_MAPPING_SYNC_INTERVAL_SECONDS=3600
+MODEL_MAPPING_SYNC_TIMEOUT_SECONDS=15
+```
+
+---
+
+## Model Speed Test (Admin Portal)
+
+The Model Mapping page of the admin portal has a **Speed** column with a per-row **Test** button. One click runs a single streaming request for that row's Bedrock model ID through the proxy, stores the timing result, and shows the latest TTFT/OTPS in the cell. Hovering the cell opens a chart of the last 10 runs. Rows that map to the same Bedrock model ID share history.
+
+### How it works
+
+- Admin backend (`admin_portal/backend/services/speed_test.py`, routes in `admin_portal/backend/api/model_mapping.py`) sends `POST {PROXY_BASE_URL}/v1/messages` with `stream: true`, `model = <bedrock_model_id>` (the proxy passes unknown IDs through unchanged, so the request takes the same InvokeModel / Converse / OpenAI-compat route a real client would), a fixed prose prompt, `max_tokens = SPEED_TEST_MAX_TOKENS`, and **no `thinking` field**. Claude Fable 5 / 5.1 reject an explicit `thinking.type = disabled` with a 400 (thinking is always adaptive there), so the test lets every model run its default mode and records whether thinking actually happened in `has_reasoning`. The whole run is bounded by `SPEED_TEST_TIMEOUT_SECONDS`.
+- The admin backend never calls Bedrock directly and knows nothing about routing rules; it is an ordinary HTTP client of the proxy. Behind CloudFront the ALB rejects requests without the CloudFront secret header, so CDK sets `PROXY_BASE_URL` to the distribution's HTTPS URL; without CloudFront it is the ALB `http://` URL. Locally it defaults to `http://localhost:8000`.
+
+### Metrics
+
+| Field | Definition |
+|---|---|
+| `ttft_ms` | Time from request send to the first **non-empty** `content_block_delta` of any type (`thinking_delta`, `text_delta` or `input_json_delta`). Empty deltas are ignored |
+| `total_ms` | Time from request send to `message_stop` (or stream close) |
+| `output_tokens` | `usage.output_tokens` from `message_delta`; includes reasoning/thinking tokens whether or not the model streamed them |
+| `reasoning_tokens` | `usage.reasoning_tokens` from `message_delta` (proxy extension, set on the OpenAI-compat path from `completion_tokens_details.reasoning_tokens`); `null` when the upstream gives no breakdown |
+| `otps` | `streamed_tokens / ((total_ms - ttft_ms) / 1000)` where `streamed_tokens = output_tokens` if thinking was streamed (`has_reasoning`) or no `reasoning_tokens` were reported, else `output_tokens - reasoning_tokens` (hidden reasoning happened before the first delta and would inflate the rate); `null` if the denominator is <= 0 or no tokens were reported |
+| `has_reasoning` | `true` if any `thinking_delta` was seen |
+| `status` / `error` | `ok`, or `error` with the proxy/transport error message (non-2xx, timeout, malformed stream, no delta, or only empty deltas — i.e. `max_tokens` exhausted by hidden reasoning) |
+
+No `thinking` config is sent, so models that think by default (Fable 5.x, Opus 5, Sonnet 5 adaptive mode) may include some thinking time in TTFT; `has_reasoning` marks runs that emitted thinking deltas. Models that reason internally without exposing it (e.g. some Mantle models) will still show a large TTFT with `has_reasoning=false`; that is recorded as-is because it is what clients experience. Failed runs are stored too, so the history shows them.
+
+### Internal API key
+
+The first test lazily creates one proxy API key with `user_id = "admin-speedtest"`, `name = "admin-speedtest"`, low rate/TPM limits and a small monthly budget, and reuses it afterwards (a 401 from the proxy invalidates the cached key and re-provisions once). It is an ordinary key: it appears on the API Keys page, its usage shows up under that key in the dashboard, and deleting it just triggers re-creation on the next test.
+
+### Storage and retention
+
+Results live in the `anthropic-proxy-speed-tests` DynamoDB table (PK `bedrock_model_id`, SK `tested_at` epoch ms, TTL attribute `expires_at` = 90 days). Created by `DynamoDBClient.create_tables()` / `scripts/setup_tables.py`, defined in CDK with `RETAIN`, and granted to both the proxy and admin task roles.
+
+### Endpoints
+
+- `POST /api/model-mapping/speed-test` — body `{"bedrock_model_id": "..."}`; returns the stored record (HTTP 200 even when `status="error"`; 503 when `PROXY_BASE_URL` is empty or key provisioning fails).
+- `GET /api/model-mapping/speed-test/latest` — latest record per Bedrock model ID in the current mapping list.
+- `GET /api/model-mapping/speed-test/history/{bedrock_model_id}?limit=10` — newest first, `limit` 1-50.
+
+### Configuration
+
+```bash
+PROXY_BASE_URL=http://localhost:8000          # proxy the admin portal tests against (CDK sets CloudFront/ALB URL)
+DYNAMODB_SPEED_TESTS_TABLE=anthropic-proxy-speed-tests
+SPEED_TEST_MAX_TOKENS=600                     # must cover hidden reasoning (gpt-5.x) + the ~200-token answer
+SPEED_TEST_TIMEOUT_SECONDS=90
+```
+
+### Related proxy fix: disabled thinking no longer enables reasoning
+
+Before this feature, a request carrying `"thinking": {"type": "disabled"}` was treated as truthy on the OpenAI-compat path (`AnthropicToOpenAIConverter` set `reasoning_effort="high"`) and on the Converse path (`AnthropicToBedrockConverter` set Nova 2 `reasoningConfig` / Kimi `reasoning_effort`), i.e. it *enabled* reasoning. Both converters now only enable reasoning when `thinking.type == "enabled"`; `thinking=None` and `enabled` behave exactly as before, and the InvokeModel path still forwards the dict unchanged (`disabled` is valid Anthropic API input).
+
+---
+
 ## OpenAI Passthrough
 
-Adds new `/openai/v1/*` endpoints that accept OpenAI-native API formats and call `bedrock-mantle`. Distinct from `ENABLE_OPENAI_COMPAT` (which converts Anthropic-format requests on `/v1/messages` into OpenAI calls).
+Adds `/openai/v1/*` endpoints that accept OpenAI-native API formats.
+After model mapping, scoped non-Claude model IDs (`global.`, `us.`, `eu.`,
+`apac.`, `us-gov.`, etc.) default to Bedrock Runtime `/openai/v1/responses`.
+Unscoped models retain the configured endpoint. This selection also applies to
+Anthropic requests on `/v1/messages`, independently of `ENABLE_OPENAI_COMPAT`.
+Set `ENABLE_BEDROCK_RESPONSES=False` to restore previous routing.
+
+The Runtime transport supports a Bedrock API key or AWS SigV4 credentials.
+AWS Mantle URLs select the corresponding Runtime region for scoped IDs; explicit
+custom provider endpoints are honored. The Anthropic conversion keeps the original
+client model name in its response and sends the mapped ID upstream. It uses
+`store=False` and the full conversation on each turn, including tool results.
+Responses SSE events become Anthropic text, thinking, tool argument, and usage
+events as they arrive. An exhausted output budget maps to `stop_reason=max_tokens`.
+
+Runtime rejects `background=True` and does not execute hosted tools. Existing
+proxy web-search loops continue to execute tools locally. Upstream model/parameter
+errors are surfaced without silently switching APIs. Native Responses fields are
+preserved on the Runtime passthrough path. Retrieval routes have no model field:
+configure `OPENAI_BASE_URL` to the Runtime endpoint (or use a provider override)
+when retrieving stored Runtime responses.
 
 ### When to use it
 
@@ -482,7 +618,9 @@ Adds new `/openai/v1/*` endpoints that accept OpenAI-native API formats and call
 ```bash
 ENABLE_OPENAI_PASSTHROUGH=True
 BEDROCK_API_KEY=<your-bedrock-api-key>
-MANTLE_ENDPOINT_URL=https://bedrock-mantle.us-east-1.api.aws/v1
+OPENAI_BASE_URL=https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1
+# MANTLE_ENDPOINT_URL, if also set, takes precedence over OPENAI_BASE_URL.
+# ENABLE_BEDROCK_RESPONSES=True  # default
 ```
 
 ### Endpoints

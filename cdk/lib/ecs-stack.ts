@@ -8,6 +8,7 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
@@ -32,6 +33,7 @@ export interface ECSStackProps extends cdk.StackProps {
   providersTable: dynamodb.Table;
   betaHeadersTable: dynamodb.Table;
   responseContextTable: dynamodb.Table;
+  speedTestsTable: dynamodb.Table;
   // Cognito (optional - for admin portal)
   cognitoUserPoolId?: string;
   cognitoClientId?: string;
@@ -53,7 +55,7 @@ export class ECSStack extends cdk.Stack {
 
     const { config, vpc, albSecurityGroup, ecsSecurityGroup } = props;
     const { apiKeysTable, usageTable, modelMappingTable, usageStatsTable, modelPricingTable } = props;
-    const { providerKeysTable, routingRulesTable, failoverChainsTable, smartRoutingConfigTable, providersTable, betaHeadersTable, responseContextTable } = props;
+    const { providerKeysTable, routingRulesTable, failoverChainsTable, smartRoutingConfigTable, providersTable, betaHeadersTable, responseContextTable, speedTestsTable } = props;
     const { cognitoUserPoolId, cognitoClientId } = props;
     const { database } = props;
 
@@ -82,7 +84,7 @@ export class ECSStack extends cdk.Stack {
         subnetType: ec2.SubnetType.PUBLIC,
       },
       deletionProtection: false,
-      idleTimeout: cdk.Duration.seconds(600),
+      idleTimeout: cdk.Duration.seconds(1800),
     });
 
     // Create Target Group - target type depends on launch type
@@ -149,6 +151,7 @@ export class ECSStack extends cdk.Stack {
     providersTable.grantReadWriteData(taskRole);
     betaHeadersTable.grantReadWriteData(taskRole);
     responseContextTable.grantReadWriteData(taskRole);
+    speedTestsTable.grantReadWriteData(taskRole);
 
     // Grant Bedrock permissions
     taskRole.addToPolicy(
@@ -267,6 +270,7 @@ export class ECSStack extends cdk.Stack {
       DYNAMODB_PROVIDERS_TABLE: providersTable.tableName,
       DYNAMODB_BETA_HEADERS_TABLE: betaHeadersTable.tableName,
       DYNAMODB_RESPONSE_CONTEXT_TABLE: responseContextTable.tableName,
+      DYNAMODB_SPEED_TESTS_TABLE: speedTestsTable.tableName,
 
       // Authentication
       API_KEY_HEADER: 'x-api-key',
@@ -324,6 +328,7 @@ export class ECSStack extends cdk.Stack {
 
       // OpenAI-Compatible API (Bedrock Mantle)
       ENABLE_OPENAI_COMPAT: config.enableOpenaiCompat.toString(),
+      ENABLE_BEDROCK_RESPONSES: (config.enableBedrockResponses ?? true).toString(),
       ENABLE_OPENAI_PASSTHROUGH: config.enableOpenaiPassthrough.toString(),
       ...(config.openaiBaseUrl && { MANTLE_ENDPOINT_URL: config.openaiBaseUrl }),
       ...((process.env.BEDROCK_API_KEY || process.env.OPENAI_API_KEY) && {
@@ -331,7 +336,7 @@ export class ECSStack extends cdk.Stack {
       }),
 
       // Streaming
-      STREAMING_TIMEOUT: '300',
+      STREAMING_TIMEOUT: '1800',
 
       // Bedrock Concurrency
       BEDROCK_THREAD_POOL_SIZE: config.bedrockThreadPoolSize.toString(),
@@ -376,6 +381,7 @@ export class ECSStack extends cdk.Stack {
           providersTable,
           betaHeadersTable,
           responseContextTable,
+          speedTestsTable,
         },
         cognitoUserPoolId,
         cognitoClientId,
@@ -410,6 +416,25 @@ export class ECSStack extends cdk.Stack {
         },
       });
 
+      // Optional custom domain: attach an alternate domain name + ACM cert so
+      // the distribution serves HTTPS for e.g. bedrock-api.example.com.
+      // Without these, CloudFront only answers on its default *.cloudfront.net
+      // hostname and fails the TLS handshake for any custom domain.
+      // The ACM cert MUST live in us-east-1 (a CloudFront requirement).
+      const customDomain = config.cloudFrontDomainName;
+      const customCertArn = config.cloudFrontCertificateArn;
+      if (Boolean(customDomain) !== Boolean(customCertArn)) {
+        throw new Error(
+          'cloudFrontDomainName and cloudFrontCertificateArn must be set together. ' +
+          `Got domain=${customDomain ?? 'unset'}, certArn=${customCertArn ?? 'unset'}. ` +
+          'A domain without a matching us-east-1 ACM cert would deploy a distribution ' +
+          'that rejects the custom hostname.'
+        );
+      }
+      const customCert = customDomain && customCertArn
+        ? acm.Certificate.fromCertificateArn(this, 'CloudFrontCertificate', customCertArn)
+        : undefined;
+
       // Create CloudFront Distribution
       // NOTE: readTimeout (default 60s, max 180s with quota increase) affects:
       //   - Streaming: only time-to-first-byte (message_start arrives quickly, so 60s is fine)
@@ -418,6 +443,9 @@ export class ECSStack extends cdk.Stack {
       //   responses, request AWS quota increase via Support Console.
       const distribution = new cloudfront.Distribution(this, 'Distribution', {
         comment: `Anthropic Proxy ${config.environmentName} - HTTPS termination`,
+        ...(customDomain && customCert
+          ? { domainNames: [customDomain], certificate: customCert }
+          : {}),
         defaultBehavior: {
           origin: new origins.HttpOrigin(this.alb.loadBalancerDnsName, {
             protocolPolicy: cloudfront.OriginProtocolPolicy.HTTP_ONLY,
@@ -923,6 +951,7 @@ export class ECSStack extends cdk.Stack {
       providersTable: dynamodb.Table;
       betaHeadersTable: dynamodb.Table;
       responseContextTable: dynamodb.Table;
+      speedTestsTable: dynamodb.Table;
     },
     cognitoUserPoolId?: string,
     cognitoClientId?: string,
@@ -968,6 +997,24 @@ export class ECSStack extends cdk.Stack {
       DYNAMODB_PROVIDERS_TABLE: tables.providersTable.tableName,
       DYNAMODB_BETA_HEADERS_TABLE: tables.betaHeadersTable.tableName,
       DYNAMODB_RESPONSE_CONTEXT_TABLE: tables.responseContextTable.tableName,
+      DYNAMODB_SPEED_TESTS_TABLE: tables.speedTestsTable.tableName,
+      // Proxy base URL used by the Model Mapping speed test (admin -> proxy /v1/messages).
+      // With CloudFront enabled the ALB rejects requests lacking X-CloudFront-Secret, so the
+      // admin container must go through the distribution. The distribution is created in the
+      // constructor AFTER this service (the CloudFront listener rules need this.adminTargetGroup),
+      // so resolve the domain lazily at synth time instead of reordering construction.
+      PROXY_BASE_URL: config.enableCloudFront
+        ? cdk.Lazy.string({
+            produce: () => {
+              if (!this.distribution) {
+                throw new Error(
+                  'PROXY_BASE_URL: enableCloudFront is true but no CloudFront distribution was created'
+                );
+              }
+              return `https://${this.distribution.distributionDomainName}`;
+            },
+          })
+        : `http://${this.alb.loadBalancerDnsName}`,
       // Cognito (if configured)
       ...(cognitoUserPoolId && { COGNITO_USER_POOL_ID: cognitoUserPoolId }),
       ...(cognitoClientId && { COGNITO_CLIENT_ID: cognitoClientId }),
@@ -1091,6 +1138,7 @@ export class ECSStack extends cdk.Stack {
     tables.providersTable.grantReadWriteData(taskRole);
     tables.betaHeadersTable.grantReadWriteData(taskRole);
     tables.responseContextTable.grantReadWriteData(taskRole);
+    tables.speedTestsTable.grantReadWriteData(taskRole);
 
     // Output Admin Portal information
     new cdk.CfnOutput(this, 'AdminPortalServiceName', {

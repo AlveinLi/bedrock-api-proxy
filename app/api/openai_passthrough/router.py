@@ -10,13 +10,22 @@ import logging
 from typing import Any, cast
 from uuid import uuid4
 
+from botocore.credentials import Credentials
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.openai_passthrough.chat_responses_adapter import (
+    MAX_UNSUPPORTED_PARAM_RETRIES,
     chat_request_to_response_request,
+    clamp_reasoning_effort,
+    clamp_tool_choice,
+    downgrade_unsupported_tools,
+    normalize_message_content,
+    pop_unsupported_parameter,
     response_to_chat_completion,
+    sanitize_input_items,
     stream_responses_as_chat_completions,
+    strip_learned_unsupported_params,
 )
 from app.api.openai_passthrough.client import get_client, upstream_headers, upstream_url
 from app.api.openai_passthrough.context_store import (
@@ -45,6 +54,11 @@ from app.core.timezone import now_utc
 from app.db.dynamodb import DynamoDBClient, ModelMappingManager, UsageTracker
 from app.db.provider_manager import ProviderManager
 from app.middleware.auth import get_api_key_info
+from app.services.bedrock_openai import (
+    is_runtime_model,
+    is_runtime_url,
+    resolve_runtime_base_url,
+)
 from app.services.bedrock_service import BedrockService
 from app.services.content_audit_service import record_content_audit
 from app.services.web_search_service import get_web_search_service
@@ -165,31 +179,88 @@ def _provider_manager() -> ProviderManager:
     return _provider
 
 
+class UpstreamProviderError(ValueError):
+    """A selected Runtime provider cannot supply its own credentials."""
+
+
 def _resolve_upstream_target(
     api_key_info: dict[str, Any] | None,
+    model: str | None = None,
+    extensions: dict[str, Any] | None = None,
 ) -> tuple[str | None, str | None]:
     """Resolve the upstream (base_url, api_key) for this request.
 
     When the API key is associated with a provider (``provider_id``), the
     provider's ``endpoint_url`` and credential override the global Mantle
-    defaults. Returns ``(None, None)`` overrides — meaning "use global
-    defaults" — when no active provider is configured.
+    defaults. For Runtime requests, invalid provider credentials fail closed;
+    ``extensions`` carries that provider's AWS credentials to the signing hook.
+    Legacy requests retain their fallback to global defaults.
     """
     provider_id = api_key_info.get("provider_id") if api_key_info else None
     if not provider_id:
         return None, None
+    runtime_request = bool(
+        model
+        and (
+            (settings.enable_bedrock_responses and is_runtime_model(model))
+            or is_runtime_url(settings.openai_base_url)
+        )
+    )
     try:
         mgr = _provider_manager()
         provider = mgr.get_provider(provider_id)
+        if model and provider:
+            runtime_request = bool(
+                (settings.enable_bedrock_responses and is_runtime_model(model))
+                or is_runtime_url(
+                    provider.get("endpoint_url") or settings.openai_base_url
+                )
+            )
         if not provider or not provider.get("is_active", True):
+            if runtime_request:
+                raise UpstreamProviderError("Selected Runtime provider is unavailable")
             return None, None
         base_url = provider.get("endpoint_url") or None
         api_key = None
-        if provider.get("auth_type") == "bearer_token":
+        auth_type = provider.get("auth_type", "ak_sk")
+        if auth_type == "bearer_token":
             creds = mgr.get_decrypted_credentials(provider_id) or {}
             api_key = creds.get("bearer_token") or None
+        if runtime_request:
+            base_url = resolve_runtime_base_url(
+                base_url, region=provider.get("aws_region") or None
+            )
+            if auth_type == "bearer_token":
+                if not isinstance(api_key, str) or not api_key.strip():
+                    raise UpstreamProviderError(
+                        "Selected Runtime provider has no token"
+                    )
+            elif auth_type == "ak_sk":
+                # An explicit empty key suppresses the global bearer key so
+                # this provider's AWS identity is used by the request hook.
+                api_key = ""
+                creds = mgr.get_decrypted_credentials(provider_id) or {}
+                if not all(
+                    isinstance(creds.get(name), str) and creds[name].strip()
+                    for name in ("access_key_id", "secret_access_key")
+                ):
+                    raise UpstreamProviderError(
+                        "Selected Runtime provider has no AWS credentials"
+                    )
+                if extensions is not None:
+                    extensions["bedrock_credentials"] = Credentials(
+                        creds["access_key_id"],
+                        creds["secret_access_key"],
+                        creds.get("session_token"),
+                    )
+            else:
+                raise UpstreamProviderError("Selected Runtime provider auth is invalid")
         return base_url, api_key
     except Exception:  # pragma: no cover - defensive
+        if runtime_request:
+            raise UpstreamProviderError(
+                "Selected Runtime provider is unavailable or has invalid credentials"
+            ) from None
         logger.warning("[OPENAI-PASSTHROUGH] provider resolution failed, using default")
         return None, None
 
@@ -203,7 +274,7 @@ def _record_usage(
     _, usage, _ = _managers()
     norm = normalize_usage(raw_usage, api_surface)
     try:
-        usage.record_usage(
+        usage.record_usage_nowait(
             api_key=api_key_info.get("api_key", ""),
             request_id=str(uuid4()),
             model=model,
@@ -308,8 +379,22 @@ async def chat_completions(
     mapping, _, _ = _managers()
     body["model"] = resolve_model_id(body.get("model", ""), mapping)
     upstream_body = chat_request_to_response_request(body)
+    pre_stripped = strip_learned_unsupported_params(upstream_body)
+    if pre_stripped:
+        logger.info(
+            "[OPENAI-PASSTHROUGH] proactively stripped learned unsupported "
+            "parameters %s for model %s",
+            pre_stripped,
+            body["model"],
+        )
     extra = _passthrough_extra_headers(request)
-    base_url, api_key = _resolve_upstream_target(api_key_info)
+    extensions: dict[str, Any] = {}
+    try:
+        base_url, api_key = _resolve_upstream_target(
+            api_key_info, model=body["model"], extensions=extensions
+        )
+    except UpstreamProviderError as exc:
+        return _api_error_response(exc)
     _info_log_upstream_request(
         method="POST",
         path="/responses",
@@ -319,30 +404,51 @@ async def chat_completions(
     )
 
     if body.get("stream"):
-        try:
-            upstream_resp, error_body = await open_upstream_stream(
-                "POST",
-                "/responses",
-                upstream_body,
-                extra,
-                base_url=base_url,
-                api_key=api_key,
-            )
-        except UpstreamConnectionError as exc:
-            return JSONResponse(
-                {"error": {"message": exc.message, "type": "upstream_error"}},
-                status_code=exc.status_code,
-            )
-        if error_body is not None:
+        retries_left = MAX_UNSUPPORTED_PARAM_RETRIES
+        while True:
+            try:
+                upstream_resp, error_body = await open_upstream_stream(
+                    "POST",
+                    "/responses",
+                    upstream_body,
+                    extra,
+                    base_url=base_url,
+                    api_key=api_key,
+                    extensions=extensions,
+                )
+            except UpstreamConnectionError as exc:
+                return JSONResponse(
+                    {"error": {"message": exc.message, "type": "upstream_error"}},
+                    status_code=exc.status_code,
+                )
+            if error_body is None:
+                break
             error_payload = _decode_error_body(error_body)
-            _info_log_upstream_response(
-                path="/responses",
-                status_code=upstream_resp.status_code,
-                body=error_payload,
-                stream=True,
-                headers=upstream_resp.headers,
+            dropped = (
+                pop_unsupported_parameter(
+                    upstream_body, upstream_resp.status_code, error_payload
+                )
+                if retries_left > 0
+                else None
             )
-            return JSONResponse(error_payload, status_code=upstream_resp.status_code)
+            if dropped is None:
+                _info_log_upstream_response(
+                    path="/responses",
+                    status_code=upstream_resp.status_code,
+                    body=error_payload,
+                    stream=True,
+                    headers=upstream_resp.headers,
+                )
+                return JSONResponse(
+                    error_payload, status_code=upstream_resp.status_code
+                )
+            retries_left -= 1
+            logger.info(
+                "[OPENAI-PASSTHROUGH] dropped unsupported parameter %r for "
+                "model %s and retrying",
+                dropped,
+                body["model"],
+            )
         _info_log_upstream_response(
             path="/responses",
             status_code=upstream_resp.status_code,
@@ -376,20 +482,41 @@ async def chat_completions(
             media_type="text/event-stream",
         )
 
-    resp = await get_client().post(
-        upstream_url("/responses", base_url=base_url),
-        json=upstream_body,
-        headers=upstream_headers(extra, api_key=api_key),
-    )
-    if resp.status_code >= 400:
-        error_payload = _safe_json(resp)
-        _info_log_upstream_response(
-            path="/responses",
-            status_code=resp.status_code,
-            body=error_payload,
-            headers=resp.headers,
+    retries_left = MAX_UNSUPPORTED_PARAM_RETRIES
+    while True:
+        resp = await get_client().post(
+            upstream_url(
+                "/responses",
+                base_url=base_url,
+                model=upstream_body.get("model"),
+            ),
+            json=upstream_body,
+            headers=upstream_headers(extra, api_key=api_key),
+            extensions=extensions,
         )
-        return JSONResponse(error_payload, status_code=resp.status_code)
+        if resp.status_code < 400:
+            break
+        error_payload = _safe_json(resp)
+        dropped = (
+            pop_unsupported_parameter(upstream_body, resp.status_code, error_payload)
+            if retries_left > 0
+            else None
+        )
+        if dropped is None:
+            _info_log_upstream_response(
+                path="/responses",
+                status_code=resp.status_code,
+                body=error_payload,
+                headers=resp.headers,
+            )
+            return JSONResponse(error_payload, status_code=resp.status_code)
+        retries_left -= 1
+        logger.info(
+            "[OPENAI-PASSTHROUGH] dropped unsupported parameter %r for "
+            "model %s and retrying",
+            dropped,
+            body["model"],
+        )
 
     data = resp.json()
     chat_data = response_to_chat_completion(data, model=body["model"])
@@ -425,7 +552,56 @@ async def responses_create(
     mapping, _, context_store = _managers()
     body["model"] = resolve_model_id(body.get("model", ""), mapping)
     extra = _passthrough_extra_headers(request)
-    base_url, api_key = _resolve_upstream_target(api_key_info)
+    extensions: dict[str, Any] = {}
+    try:
+        base_url, api_key = _resolve_upstream_target(
+            api_key_info, model=body["model"], extensions=extensions
+        )
+    except UpstreamProviderError as exc:
+        return _api_error_response(exc)
+    runtime_request = (
+        settings.enable_bedrock_responses and is_runtime_model(body["model"])
+    ) or is_runtime_url(
+        upstream_url("/responses", base_url=base_url, model=body["model"])
+    )
+    if not runtime_request:
+        # bedrock-mantle accepts only `function` and `mcp` tools; any other variant
+        # (custom, namespace, web_search, ...) rejects the whole request, taking
+        # every other tool with it. The Codex CLI sends both custom and namespace.
+        downgraded_tools = downgrade_unsupported_tools(body)
+        if downgraded_tools:
+            logger.info(
+                "[OPENAI-PASSTHROUGH] rewrote unsupported tools as function tools: %s",
+                ", ".join(downgraded_tools),
+            )
+        # The replayed conversation history has the same problem: one item type
+        # mantle cannot deserialize rejects the whole request, and because the client
+        # keeps replaying that history the conversation stays broken from then on.
+        sanitized_input = sanitize_input_items(body)
+        if sanitized_input:
+            logger.info(
+                "[OPENAI-PASSTHROUGH] adjusted unsupported input items: %s",
+                ", ".join(sanitized_input),
+            )
+        # Clients keep adding reasoning tiers above what mantle serves (Codex
+        # exposes ultra/max); an unknown value fails the whole request.
+        clamped_effort = clamp_reasoning_effort(body)
+        if clamped_effort:
+            logger.info(
+                "[OPENAI-PASSTHROUGH] clamped reasoning effort: %s", clamped_effort
+            )
+        # Assistant turns must be plain strings and only input_text parts are
+        # accepted; clients replay both in the richer spec shape.
+        normalized_content = normalize_message_content(body)
+        if normalized_content:
+            logger.info(
+                "[OPENAI-PASSTHROUGH] normalized message content: %s",
+                ", ".join(sorted(set(normalized_content))),
+            )
+        # Mantle serves only tool_choice=auto.
+        clamped_choice = clamp_tool_choice(body)
+        if clamped_choice:
+            logger.info("[OPENAI-PASSTHROUGH] %s", clamped_choice)
     _info_log_upstream_request(
         method="POST",
         path="/responses",
@@ -485,10 +661,14 @@ async def responses_create(
 
         try:
             web_search_service = get_web_search_service()
+            provider_context = {}
+            if runtime_request and api_key_info.get("provider_id"):
+                provider_context["provider_id"] = api_key_info["provider_id"]
             bedrock_service = BedrockService(
                 openai_base_url=provider_base_url,
                 openai_api_key=provider_api_key,
                 openai_use_responses=True,
+                **provider_context,
             )
         except Exception as exc:
             return _api_error_response(exc)
@@ -585,6 +765,7 @@ async def responses_create(
                 extra,
                 base_url=base_url,
                 api_key=api_key,
+                extensions=extensions,
             )
         except UpstreamConnectionError as exc:
             return JSONResponse(
@@ -618,9 +799,10 @@ async def responses_create(
         )
 
     resp = await get_client().post(
-        upstream_url("/responses", base_url=base_url),
+        upstream_url("/responses", base_url=base_url, model=body.get("model")),
         json=body,
         headers=upstream_headers(extra, api_key=api_key),
+        extensions=extensions,
     )
     if resp.status_code >= 400:
         error_payload = _safe_json(resp)
@@ -664,7 +846,11 @@ async def _passthrough_request(
     )
     resp = await get_client().request(
         request.method,
-        upstream_url(path, base_url=base_url),
+        upstream_url(
+            path,
+            base_url=base_url,
+            model=body.get("model") if isinstance(body, dict) else None,
+        ),
         json=body,
         headers=upstream_headers(extra, api_key=api_key),
     )

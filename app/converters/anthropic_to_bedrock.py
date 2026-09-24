@@ -9,6 +9,7 @@ import json
 from typing import Any, Dict, List, Optional, Union
 
 from app.core.config import settings
+from app.converters.thinking import is_thinking_enabled
 from app.schemas.anthropic import (
     Base64ImageSource,
     ContentBlock,
@@ -48,10 +49,14 @@ class AnthropicToBedrockConverter:
         Args:
             dynamodb_client: Optional DynamoDB client for custom mappings
         """
-        self.model_mapping = settings.default_model_mapping
         self.dynamodb_client = dynamodb_client
         self._model_mapping_manager = None
         self._resolved_model_id = None  # Cache the resolved model ID
+
+    @property
+    def model_mapping(self) -> Dict[str, str]:
+        """Live default mapping (refreshed in-process by the model mapping sync service)."""
+        return settings.default_model_mapping
 
     def convert_request(
         self, request: MessageRequest, anthropic_beta: Optional[str] = None
@@ -105,7 +110,8 @@ class AnthropicToBedrockConverter:
             additional_fields["top_k"] = request.top_k
 
         # Handle extended thinking if enabled
-        if request.thinking and settings.enable_extended_thinking:
+        # ``{"type": "disabled"}`` is a valid Anthropic value and must not enable reasoning.
+        if is_thinking_enabled(request.thinking) and settings.enable_extended_thinking:
             if self._is_nova_2_model():
                 # Nova 2 models use a specific reasoningConfig format
                 # Extract effort level from thinking config if provided, default to "medium"
@@ -382,6 +388,28 @@ class AnthropicToBedrockConverter:
         bedrock_messages = []
 
         for message in messages:
+            # Preserve the existing InvokeModel-only handling of tool changes.
+            # Plain system instructions must reach ConverseRequestAdapter,
+            # which moves them to the top-level system field.
+            if (
+                message.role == "system"
+                and isinstance(message.content, list)
+                and any(
+                    (
+                        block.get("type")
+                        if isinstance(block, dict)
+                        else getattr(block, "type", None)
+                    )
+                    in {"tool_addition", "tool_removal"}
+                    for block in message.content
+                )
+            ):
+                print(
+                    "[CONVERTER] Skipping mid-conversation tool-change message "
+                    "(unsupported by Converse API)"
+                )
+                continue
+
             bedrock_message = {
                 "role": message.role,
                 "content": self._convert_content_blocks(message.content),

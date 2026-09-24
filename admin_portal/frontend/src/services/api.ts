@@ -16,11 +16,20 @@ import type {
   PricingCreate,
   PricingUpdate,
   PricingListResponse,
+  PricingSyncRequest,
+  PricingSyncResult,
   DashboardStats,
+  DailyUsageResponse,
   ModelMapping,
   ModelMappingCreate,
   ModelMappingUpdate,
+  ModelMappingSyncRequest,
+  ModelMappingSyncResult,
+  ModelMappingSyncStatus,
   ModelMappingListResponse,
+  SpeedTestRecord,
+  SpeedTestHistoryResponse,
+  SpeedTestLatestResponse,
   ProviderKey,
   ProviderKeyCreate,
   ProviderKeyUpdate,
@@ -107,6 +116,21 @@ export async function isAuthenticated(): Promise<boolean> {
 }
 
 /**
+ * Error thrown by apiFetch for non-2xx responses. Carries the HTTP status so
+ * callers can branch on it (e.g. 503 = server misconfigured) while remaining a
+ * plain `Error` for callers that only read `.message`.
+ */
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
+/**
  * Base fetch wrapper with Bearer token authentication.
  */
 async function apiFetch<T>(
@@ -141,7 +165,10 @@ async function apiFetch<T>(
     }
 
     const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
-    throw new Error(error.detail || error.message || `HTTP error! status: ${response.status}`);
+    throw new ApiError(
+      error.detail || error.message || `HTTP error! status: ${response.status}`,
+      response.status
+    );
   }
 
   return response.json();
@@ -238,6 +265,9 @@ export const dashboardApi = {
   getStats: async (): Promise<DashboardStats> => {
     return apiFetch('/dashboard/stats');
   },
+  getDailyUsage: async (days: number): Promise<DailyUsageResponse> => {
+    return apiFetch(`/dashboard/daily-usage?days=${days}`);
+  },
 };
 
 // API Keys API
@@ -298,6 +328,10 @@ export const apiKeysApi = {
 
   syncToDynamo: async (): Promise<{ synced: number; failed: number; total?: number }> => {
     return apiFetch('/keys/sync-to-dynamo', { method: 'POST' });
+  },
+    
+  getDailyUsage: async (apiKey: string, days: number = 7): Promise<DailyUsageResponse> => {
+    return apiFetch(`/keys/${encodeURIComponent(apiKey)}/daily-usage?days=${days}`);
   },
 };
 
@@ -399,7 +433,6 @@ export const contentAuditHistoryApi = {
       `/content-audit-history/archive/${encodeURIComponent(table)}/export/markdown${buildQuery(params)}`,
       `${table}-export.md`
     );
-  },
 };
 
 // Pricing API
@@ -447,6 +480,13 @@ export const pricingApi = {
       method: 'DELETE',
     });
   },
+
+  sync: async (data?: PricingSyncRequest): Promise<PricingSyncResult> => {
+    return apiFetch('/pricing/sync', {
+      method: 'POST',
+      body: JSON.stringify(data || {}),
+    });
+  },
 };
 
 // Model Mapping API
@@ -481,6 +521,39 @@ export const modelMappingApi = {
     return apiFetch(`/model-mapping/${encodeURIComponent(anthropicModelId)}`, {
       method: 'DELETE',
     });
+  },
+
+  sync: async (data?: ModelMappingSyncRequest): Promise<ModelMappingSyncResult> => {
+    return apiFetch('/model-mapping/sync', {
+      method: 'POST',
+      body: JSON.stringify(data || {}),
+    });
+  },
+
+  syncStatus: async (): Promise<ModelMappingSyncStatus> => {
+    return apiFetch('/model-mapping/sync/status');
+  },
+
+  // Speed test (TTFT / OTPS through the proxy). 200 even when status === 'error';
+  // 503 (ApiError.status) when PROXY_BASE_URL / internal key is not configured.
+  runSpeedTest: async (bedrockModelId: string): Promise<SpeedTestRecord> => {
+    return apiFetch('/model-mapping/speed-test', {
+      method: 'POST',
+      body: JSON.stringify({ bedrock_model_id: bedrockModelId }),
+    });
+  },
+
+  speedTestLatest: async (): Promise<SpeedTestLatestResponse> => {
+    return apiFetch('/model-mapping/speed-test/latest');
+  },
+
+  speedTestHistory: async (
+    bedrockModelId: string,
+    limit = 10
+  ): Promise<SpeedTestHistoryResponse> => {
+    return apiFetch(
+      `/model-mapping/speed-test/history/${encodeURIComponent(bedrockModelId)}?limit=${limit}`
+    );
   },
 };
 

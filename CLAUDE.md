@@ -8,8 +8,9 @@
 
 ```bash
 # Install
+git submodule update --init   # model-mappings/ = offline default model-mapping snapshot
 uv sync                    # or: pip install -e ".[dev]"
-cp .env.example .env       # configure AWS credentials + settings
+cp env.example .env        # configure AWS credentials + settings
 
 # Setup
 uv run scripts/setup_tables.py
@@ -36,10 +37,11 @@ black app tests && ruff check app tests && mypy app
 
 - **InvokeModel API** (Claude models): Native Anthropic format, minimal conversion, full beta feature support
 - **Converse API** (non-Claude models): Requires format conversion, unified API for all Bedrock models
+- **Runtime Responses API** (default for scoped non-Claude IDs): After mapping, `global.`, `us.`, `eu.`, `apac.`, `us-gov.`, etc. use `https://bedrock-runtime.<region>.amazonaws.com/openai/v1/responses`. Supports streaming, tools, and AWS SigV4 or Bedrock API-key authentication. `ENABLE_BEDROCK_RESPONSES=False` restores previous routing.
 - **OpenAI Chat Completions API** (non-Claude models, optional): When `ENABLE_OPENAI_COMPAT=True`, non-Claude models use Bedrock's OpenAI-compatible endpoint via bedrock-mantle instead of Converse API
 - **OpenAI Passthrough** (any model bedrock-mantle accepts, optional): When `ENABLE_OPENAI_PASSTHROUGH=True`, mounts `/openai/v1/{chat/completions,responses,responses/{id},models}` for clients using OpenAI-format directly.
 
-**API selection**: If model ID contains "anthropic" or "claude" → InvokeModel; else if `ENABLE_OPENAI_COMPAT` → OpenAI Chat Completions; else → Converse. OpenAI Passthrough routes are independent and mount at `/openai/v1/*`.
+**API selection**: Resolve model mapping first. Claude/Anthropic → InvokeModel; scoped non-Claude ID with default `ENABLE_BEDROCK_RESPONSES=True` → Runtime Responses; else if `ENABLE_OPENAI_COMPAT` → OpenAI Chat Completions; else → Converse. OpenAI Passthrough routes are independent at `/openai/v1/*` and use the same scoped-ID endpoint selection.
 
 **Multi-Provider Gateway** (optional, `MULTI_PROVIDER_ENABLED`): when enabled, a routing engine (`app/routing/`) selects a target model/provider per request (rule/cost/quality/smart routing), a key pool (`app/keypool/`) rotates encrypted provider keys with rate-limit cooldown + cross-model failover, and `app/compression/` optionally compresses agent context. All flags default off (except `FAILOVER_ENABLED`/`CACHE_AWARE_ROUTING_ENABLED`) — zero impact when `MULTI_PROVIDER_ENABLED=False`. See [docs/smart-routing-guide.md](docs/smart-routing-guide.md).
 
@@ -49,6 +51,16 @@ black app tests && ruff check app tests && mypy app
 
 All config in `app/core/config.py` (Pydantic Settings, loads from env vars / `.env`). When adding new features, add corresponding feature flags and config options.
 
+### Model Mapping Source of Truth (2026-09)
+
+Default Anthropic → Bedrock model ID mappings are **no longer hard-coded in `app/core/config.py`**. They live in a separate repo, [xiehust/bedrock-api-proxy-model-mappings](https://github.com/xiehust/bedrock-api-proxy-model-mappings) (`model_mappings.json`), which is also checked out here as the `model-mappings/` git submodule.
+
+- **Runtime**: `app/services/model_mapping_sync_service.py` fetches `MODEL_MAPPING_SYNC_URL` at startup (proxy + admin portal) and every `MODEL_MAPPING_SYNC_INTERVAL_SECONDS`, then atomically replaces `settings.default_model_mapping`. Pushing to the mappings repo rolls out to all deployments without a redeploy.
+- **Offline fallback**: `load_bundled_model_mapping()` seeds `settings.default_model_mapping` from `model-mappings/model_mappings.json` at import time. Always clone with `--recurse-submodules` or run `git submodule update --init`; without it the default mapping is empty until the first remote sync succeeds, and both Dockerfiles fail to build (they `COPY` that file).
+- **Priority**: DynamoDB mapping table (admin portal overrides) > `DEFAULT_MODEL_MAPPING` env entries (layered on top, not a full replacement) > remote file > submodule snapshot > pass-through.
+- **Safety**: an unreachable URL, invalid JSON, non-string entries, or an empty `mappings` object never clears the active mapping; the error is exposed at `GET /api/model-mapping/sync/status` and on the admin Model Mapping page.
+- **To add a model**: edit the JSON in the submodule, `uv run python scripts/sync_model_mappings.py --validate model-mappings/model_mappings.json`, push to the mappings repo, then `git add model-mappings` here to bump the pin. Never add mappings back into `config.py`. See "Adding a New Model Mapping" below.
+
 ### DynamoDB Tables
 
 | Table | Purpose |
@@ -57,7 +69,7 @@ All config in `app/core/config.py` (Pydantic Settings, loads from env vars / `.e
 | `anthropic-proxy-usage` | Per-request usage logs |
 | `anthropic-proxy-usage-stats` | Aggregated token counts |
 | `anthropic-proxy-model-pricing` | Model pricing data |
-| `anthropic-proxy-model-mapping` | Anthropic → Bedrock model ID mapping |
+| `anthropic-proxy-model-mapping` | Anthropic → Bedrock model ID mapping (per-deployment overrides of the remote defaults) |
 | `anthropic-proxy-beta-headers` | Anthropic → Bedrock beta header mappings |
 | `anthropic-proxy-response-context` | OpenAI Responses API passthrough context store |
 | `anthropic-proxy-providers` | Multi-provider: Bedrock account/provider definitions |
@@ -65,6 +77,7 @@ All config in `app/core/config.py` (Pydantic Settings, loads from env vars / `.e
 | `anthropic-proxy-routing-rules` | Multi-provider: routing rules |
 | `anthropic-proxy-failover-chains` | Multi-provider: cross-model failover chains |
 | `anthropic-proxy-smart-routing-config` | Multi-provider: RouteLLM smart-routing config |
+| `anthropic-proxy-speed-tests` | Admin portal model speed-test history (TTFT/OTPS per Bedrock model ID, 90-day TTL) |
 
 > **Full schema, budget computation, and aggregation details**: see [docs/architecture/detailed-flows.md](docs/architecture/detailed-flows.md)
 
@@ -98,9 +111,11 @@ app/
 ├── keypool/          # Multi-provider API-key pool: rotation, failover, encryption
 ├── compression/      # Agent context compression
 └── tracing/          # OpenTelemetry distributed tracing
+model-mappings/       # git submodule: github.com/xiehust/bedrock-api-proxy-model-mappings (default model_mappings.json snapshot)
 admin_portal/
 ├── backend/          # Separate FastAPI app (auth, dashboard, keys, pricing, model_mapping, providers, provider_keys, routing, failover, beta_headers)
 └── frontend/         # Static frontend (served at /admin/ in production)
+agentcore-search-mcp/ # Standalone MCP server exposing AgentCore Gateway WebSearch (see its README)
 ```
 
 ## Key Files
@@ -130,9 +145,13 @@ Each feature has detailed docs in [docs/architecture/features.md](docs/architect
 - **Image URL Sources**: `ImageContent.source` accepts `type: "url"` (Anthropic-native shape). Proxy fetches concurrently via httpx and replaces with base64 before forwarding to Bedrock. Also accepts OpenAI-style `{"type":"image_url","image_url":{"url":...}}` blocks (both http(s) and `data:` URLs) on `/v1/messages` — coerced to native shape at validation time. Configurable timeout/size cap; no allowlist (relies on network policy).
 - **Beta Header Mapping**: Maps Anthropic beta headers → Bedrock beta headers for supported models.
 - **Tool Input Examples**: `input_examples` param on tool definitions, passed via `additionalModelRequestFields`.
+- **Mid-Conversation Tool Changes**: `role: "system"` messages carrying `tool_addition`/`tool_removal` blocks (beta `mid-conversation-tool-changes-2026-07-01`) are validated and forwarded unchanged on the InvokeModel path. Tool references: `tool_reference`, `mcp_tool_reference`, `mcp_toolset_reference`. Converse API has no equivalent, so those tool-change messages are dropped there. Plain-text inline system instructions are preserved and moved to Converse's top-level `system` field by the request adapter.
 - **Cache TTL**: Extends `cache_control` with configurable TTL (5m or 1h). Priority: API key → request → env → default.
 - **OpenTelemetry Tracing**: OTEL GenAI semantic conventions, session-based trace grouping. Zero overhead when disabled.
-- **Admin Portal**: Separate FastAPI app for API key/usage/pricing management with Cognito auth.
+- **Admin Portal**: Separate FastAPI app for API key/usage/pricing/model-mapping management with Cognito auth. The Model Mapping page shows where the active default mapping came from and has a **Refresh defaults** button (`POST /api/model-mapping/sync`, `GET /api/model-mapping/sync/status`); the portal process runs the same remote mapping sync as the proxy.
+- **Remote Default Model Mapping**: Default Anthropic → Bedrock mappings come from `model_mappings.json` in the [bedrock-api-proxy-model-mappings](https://github.com/xiehust/bedrock-api-proxy-model-mappings) repo, fetched at startup and every `MODEL_MAPPING_SYNC_INTERVAL_SECONDS` by `app/services/model_mapping_sync_service.py` (proxy and admin portal). The `model-mappings/` submodule is the offline snapshot that seeds `settings.default_model_mapping`; `DEFAULT_MODEL_MAPPING` env entries layer on top; DynamoDB overrides still win. Invalid/unreachable remote never clears the active mapping. Manual refresh: admin portal button, `POST /api/model-mapping/sync`, `scripts/sync_model_mappings.py`. Controlled by `MODEL_MAPPING_SYNC_*`.
+- **Model Speed Test**: Admin portal Model Mapping page has a per-row **Test** button that sends one streaming request through `PROXY_BASE_URL/v1/messages` (model = the row's Bedrock ID, no `thinking` field so each model runs its default mode) and records TTFT, OTPS, `output_tokens` and `has_reasoning` in `anthropic-proxy-speed-tests` (90-day TTL). Auth uses an auto-provisioned `admin-speedtest` API key (visible on the API Keys page). Hovering the Speed cell shows the last 10 runs. Routes: `POST /api/model-mapping/speed-test`, `GET /api/model-mapping/speed-test/latest`, `GET /api/model-mapping/speed-test/history/{bedrock_model_id}`. Controlled by `PROXY_BASE_URL`, `SPEED_TEST_*`.
+- **Model Pricing Sync**: Pulls model pricing from the LiteLLM price table (periodic background task in the admin portal, `POST /api/pricing/sync`, or `scripts/sync_model_pricing.py`). Synced rows are marked `pricing_source="litellm"`; manual/portal-edited rows are never overwritten unless forced. Controlled by `PRICING_SYNC_*` settings.
 - **OpenAI-Compatible API**: Non-Claude models can optionally use Bedrock's OpenAI Chat Completions API via bedrock-mantle endpoint instead of Converse API. Controlled by `ENABLE_OPENAI_COMPAT` flag. Maps `thinking` to OpenAI `reasoning` with configurable effort thresholds.
 - **OpenAI Passthrough**: New `/openai/v1/*` endpoints accept OpenAI-native Chat Completions and Responses API requests and forward them to bedrock-mantle. Distinct from `ENABLE_OPENAI_COMPAT` (which routes Anthropic-format requests on `/v1/messages`). Reuses proxy API key auth, rate limits, budgets, and usage tracking. Controlled by `ENABLE_OPENAI_PASSTHROUGH`.
 - **Multi-Provider Gateway**: Optional gateway layer for multiple Bedrock accounts/providers — routing engine (rule/cost/quality/RouteLLM smart routing), encrypted key pool with rotation + cross-model failover, and context compression. Managed via admin portal (`providers`, `provider_keys`, `routing`, `failover`). Controlled by `MULTI_PROVIDER_ENABLED` and sub-flags. See [docs/smart-routing-guide.md](docs/smart-routing-guide.md).
@@ -152,6 +171,19 @@ Each feature has detailed docs in [docs/architecture/features.md](docs/architect
 
 ### Adding a New Model Mapping
 
+**Default for every deployment** — edit `model_mappings.json` in the `model-mappings/` submodule (repo `xiehust/bedrock-api-proxy-model-mappings`), validate, push, then bump the submodule pin here:
+
+```bash
+cd model-mappings && $EDITOR model_mappings.json
+uv run python ../scripts/sync_model_mappings.py --validate model_mappings.json
+git commit -am "Add <model>" && git push origin main
+cd .. && git add model-mappings && git commit -m "chore: bump model-mappings snapshot"
+```
+
+Running proxies pick it up on the next refresh (no redeploy). Do **not** hard-code mappings in `app/core/config.py`.
+
+**Per-deployment override** — DynamoDB (admin portal, or):
+
 ```python
 from app.db.dynamodb import DynamoDBClient
 client = DynamoDBClient()
@@ -161,7 +193,7 @@ client.model_mapping_manager.set_mapping(
 )
 ```
 
-Or update `DEFAULT_MODEL_MAPPING` in `app/core/config.py`.
+or `DEFAULT_MODEL_MAPPING='{"id":"bedrock-id"}'` in the environment (layered on top of the remote defaults).
 
 ### Streaming
 
@@ -199,11 +231,17 @@ Key CDK files: `cdk/config/config.ts`, `cdk/lib/ecs-stack.ts`, `cdk/scripts/depl
 
 **Feature Flags:** `ENABLE_TOOL_USE`, `ENABLE_EXTENDED_THINKING`, `ENABLE_DOCUMENT_SUPPORT`, `ENABLE_PROGRAMMATIC_TOOL_CALLING`, `ENABLE_STANDALONE_CODE_EXECUTION`, `ENABLE_WEB_SEARCH`, `ENABLE_WEB_FETCH`, `ENABLE_TRACING`
 
-**OpenAI-Compat:** `ENABLE_OPENAI_COMPAT`, `ENABLE_OPENAI_PASSTHROUGH`, `BEDROCK_API_KEY`, `MANTLE_ENDPOINT_URL`, `OPENAI_COMPAT_THINKING_HIGH_THRESHOLD`, `OPENAI_COMPAT_THINKING_MEDIUM_THRESHOLD`
+**OpenAI-Compat:** `ENABLE_BEDROCK_RESPONSES` (default true), `ENABLE_OPENAI_COMPAT`, `ENABLE_OPENAI_PASSTHROUGH`, `BEDROCK_API_KEY`, `MANTLE_ENDPOINT_URL` (takes precedence over `OPENAI_BASE_URL`), `OPENAI_COMPAT_THINKING_HIGH_THRESHOLD`, `OPENAI_COMPAT_THINKING_MEDIUM_THRESHOLD`
 
 **Multi-Provider Gateway:** `MULTI_PROVIDER_ENABLED`, `ROUTING_ENABLED`, `SMART_ROUTING_ENABLED`, `FAILOVER_ENABLED`, `COMPRESSION_ENABLED`, `CACHE_AWARE_ROUTING_ENABLED`, `PROVIDER_KEY_ENCRYPTION_SECRET`
 
 **MySQL / Content Audit / Logging / Timezone:** `MYSQL_ENABLED`, `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE`, `MYSQL_TABLE_PREFIX`, `MYSQL_DSN`, `CONTENT_AUDIT_ENABLED`, `APP_TIMEZONE`, `LOG_TO_FILE`, `LOG_TO_STDOUT`, `LOG_FILE_PATH`
+
+**Model Mapping Sync:** `MODEL_MAPPING_SYNC_ENABLED`, `MODEL_MAPPING_SYNC_URL`, `MODEL_MAPPING_SYNC_INTERVAL_SECONDS`, `MODEL_MAPPING_SYNC_TIMEOUT_SECONDS`, `DEFAULT_MODEL_MAPPING` (local additions)
+
+**Model Pricing Sync:** `PRICING_SYNC_ENABLED`, `PRICING_SYNC_URL`, `PRICING_SYNC_INTERVAL_HOURS`, `PRICING_SYNC_PROVIDERS`, `PRICING_SYNC_CREATE_MISSING`, `PRICING_SYNC_OVERWRITE_MANUAL`
+
+**Speed Test:** `PROXY_BASE_URL`, `DYNAMODB_SPEED_TESTS_TABLE`, `SPEED_TEST_MAX_TOKENS`, `SPEED_TEST_TIMEOUT_SECONDS`
 
 See `.env.example` for full list including PTC, web search, web fetch, cache TTL, tracing, beta header, and multi-provider settings.
 
@@ -233,3 +271,24 @@ See [docs/troubleshooting.md](docs/troubleshooting.md) for health endpoints, com
 - DynamoDB lookup: 1-10ms
 - Streaming: No buffering, events streamed as received
 - Bottleneck: Almost always Bedrock API response time
+<!-- TRELLIS:START -->
+# Trellis Instructions
+
+These instructions are for AI assistants working in this project.
+
+This project is managed by Trellis. The working knowledge you need lives under `.trellis/`:
+
+- `.trellis/workflow.md` — development phases, when to create tasks, skill routing
+- `.trellis/spec/` — package- and layer-scoped coding guidelines (read before writing code in a given layer)
+- `.trellis/workspace/` — per-developer journals and session traces
+- `.trellis/tasks/` — active and archived tasks (PRDs, research, jsonl context)
+
+If a Trellis command is available on your platform (e.g. `/trellis:finish-work`, `/trellis:continue`), prefer it over manual steps. Not every platform exposes every command.
+
+If you're using Codex or another agent-capable tool, additional project-scoped helpers may live in:
+- `.agents/skills/` — reusable Trellis skills
+- `.codex/agents/` — optional custom subagents
+
+Managed by Trellis. Edits outside this block are preserved; edits inside may be overwritten by a future `trellis update`.
+
+<!-- TRELLIS:END -->

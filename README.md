@@ -57,12 +57,13 @@ A lightweight API translation service that lets you use various large language m
 
 ### Advanced
 - **Programmatic Tool Calling (PTC)**: Claude generates and executes Python code in Docker sandbox for tool calling. Supports multi-round execution, `asyncio.gather` parallel calls, and session reuse.
-- **Web Search**: Proxy-side `web_search_20250305`/`web_search_20260209` via Tavily or Brave. Domain filtering, search limits, user location. Dynamic filtering version requires Docker.
+- **Web Search**: Proxy-side `web_search_20250305`/`web_search_20260209` via Tavily /Brave/ Bedrock AgentCore Gateway WebSearch. Domain filtering, search limits, user location. Dynamic filtering version requires Docker.
+- **[AgentCore Search MCP Server](agentcore-search-mcp/)**: Standalone MCP server ([PyPI](https://pypi.org/project/agentcore-search-mcp/): `uvx agentcore-search-mcp`) exposing Amazon Bedrock AgentCore Gateway WebSearch to any MCP client (Claude Code, Codex, Cursor) — a local stdio bridge that adds the SigV4 signing the gateway requires. Independent of the proxy; includes a one-shot gateway deployment script.
 - **Web Fetch**: Proxy-side `web_fetch_20250910`/`web_fetch_20260209` via httpx (no API key). PDF support. Dynamic filtering version requires Docker.
 - **Prompt Cache TTL**: Extends `cache_control` with configurable 1-hour TTL. Three-level priority: API key → request → env default.
 - **Beta Header Mapping**: Auto-maps Anthropic beta headers to Bedrock beta headers.
 - **Tool Input Examples**: `input_examples` parameter for tool definitions.
-- **OpenAI-Compatible API**: Non-Claude models can use Bedrock's OpenAI Chat Completions API (via bedrock-mantle). Maps `thinking` → `reasoning`.
+- **OpenAI-Compatible API**: Scoped non-Claude IDs (`global.`, `us.`, etc.) default to Bedrock Runtime Responses, including streaming and tools. Unscoped models can use Mantle Chat Completions. Maps `thinking` → `reasoning`.
 - **OpenAI Passthrough**: `/openai/v1/*` endpoints forward OpenAI SDK requests to Bedrock Mantle. Supports Responses API web search with stateful `previous_response_id`.
 - **Service Tier**: Per-key Bedrock service tier (`default`/`flex`/`priority`/`reserved`) with auto-fallback.
 
@@ -137,24 +138,51 @@ The same settings apply to Claude Agent SDK. See [AgentCore Demo](https://github
 | **Docker Access** | No | Yes (socket mount) |
 | **Recommended For** | Standard API proxy | PTC/Web Search dynamic filtering |
 
+**Prerequisites:** AWS CLI configured, Node.js, and Docker running (the image is
+built locally from your working tree).
+
 ```bash
 cd cdk && npm install
 
-# Fargate (ARM64)
+# One-time per account/region
+npx cdk bootstrap aws://<account-id>/<region>
+```
+
+**Optional — enable features that need a credential.** Shared settings live in
+`config/config.ts`; secrets belong in `cdk/.env.local`, which is gitignored and
+loaded automatically, so you don't re-export them on every deploy:
+
+```bash
+cp .env.local.example .env.local   # then fill in what you need
+```
+
+Skip this entirely if you only need the Anthropic `/v1/messages` surface — it
+authenticates with the task's IAM role and needs no extra credential.
+
+```bash
+# First deploy: --all creates the Network, DynamoDB, Cognito and ECS stacks
+./scripts/deploy.sh -e prod -r us-west-2 -p arm64 --all
+
+# Subsequent deploys: application stack only (the default)
 ./scripts/deploy.sh -e prod -r us-west-2 -p arm64
 
-# EC2 (enables PTC + dynamic filtering)
+# EC2 launch type (enables PTC + dynamic filtering)
 ./scripts/deploy.sh -e prod -r us-west-2 -p arm64 -l ec2
+```
 
-# With all features
-ENABLE_CLOUDFRONT=true \
-ENABLE_WEB_SEARCH=true \
-WEB_SEARCH_PROVIDER=tavily \
-WEB_SEARCH_API_KEY=tvly-your-key \
-ENABLE_OPENAI_COMPAT=true \
-BEDROCK_API_KEY=your-bedrock-key \
-MANTLE_ENDPOINT_URL=https://bedrock-mantle.us-east-2.api.aws/openai/v1 \
-./scripts/deploy.sh -e prod -r us-west-2 -p arm64 -l ec2
+> After the first deploy, prefer the default (ECS-only). `--all` also deploys the
+> Network stack, which against a long-lived environment whose VPC has drifted
+> from this code can provision parallel NAT gateways and VPC endpoints and orphan
+> the live ones. Run `cdk diff` before any infrastructure change.
+
+Enabling a feature without its required configuration fails at synth with a
+message naming what's missing, rather than deploying a proxy that errors on every
+request. Feature flags such as `ENABLE_OPENAI_PASSTHROUGH` and
+`ENABLE_CLOUDFRONT` can go in `.env.local` alongside the secrets, or be exported
+for a single deploy:
+
+```bash
+ENABLE_CLOUDFRONT=true ./scripts/deploy.sh -e prod -r us-west-2 -p arm64
 ```
 
 Deployment takes ~15-20 minutes. See [CDK Deployment Guide](cdk/DEPLOYMENT.md) for full details. For AgentCore web search, run `AWS_REGION=us-east-1 uv run bash scripts/create_agentcore.sh` in `us-east-1`, then deploy with `WEB_SEARCH_PROVIDER=agentcore` and `AGENTCORE_GATEWAY_URL=<gateway-mcp-url>` instead of `WEB_SEARCH_API_KEY`.
@@ -172,9 +200,11 @@ visit https://xxx.cloudfront.net/admin/ Admin portal to config api keys
 ### Option 2: Local Development
 
 ```bash
-# Install
+# Install (the model-mappings/ submodule holds the offline default model-mapping snapshot)
+git clone --recurse-submodules https://github.com/xiehust/sample-bedrock-api-proxy.git
+cd sample-bedrock-api-proxy   # already cloned? run: git submodule update --init
 pip install uv && uv sync
-cp .env.example .env  # configure
+cp env.example .env  # configure
 
 # Setup DynamoDB tables and create API key
 uv run scripts/setup_tables.py
@@ -375,10 +405,21 @@ print(resp.output_text)
 ```
 
 ### Routing Logic
+- Resolve model aliases before selecting the API.
 - Model contains "anthropic" or "claude" → **InvokeModel API** (native format)
+- Other IDs with a scope prefix (`global.`, `us.`, `eu.`, `apac.`, `us-gov.`, etc.) → **Bedrock Runtime Responses API**, enabled by default independently of `ENABLE_OPENAI_COMPAT`
 - `ENABLE_OPENAI_COMPAT=true` → **OpenAI Chat Completions** (via bedrock-mantle)
 - Otherwise → **Converse API** (unified Bedrock API)
 - `/openai/v1/*` → **OpenAI Passthrough** (independent routes)
+
+Runtime uses `https://bedrock-runtime.<region>.amazonaws.com/openai/v1`.
+Set `OPENAI_BASE_URL` to select a Runtime region explicitly, or let the proxy derive
+it from the existing AWS/Mantle configuration. `MANTLE_ENDPOINT_URL` takes precedence
+if both URL variables are set. Explicit custom provider endpoints are preserved.
+Authentication uses the Bedrock API key when configured, otherwise AWS credentials
+with SigV4. Set `ENABLE_BEDROCK_RESPONSES=false` to restore previous routing.
+Model support still depends on the selected model and region; the proxy forwards
+upstream errors instead of silently retrying a different API.
 
 ### ECS Production Architecture
 
@@ -406,6 +447,7 @@ print(resp.output_text)
 | [Features](docs/architecture/features.md) | Detailed feature documentation |
 | [Troubleshooting](docs/troubleshooting.md) | Common errors and debugging |
 | [Model Mapping](docs/MODEL_MAPPING.md) | Model ID mapping reference |
+| [AgentCore Search MCP Server](agentcore-search-mcp/README.md) | Standalone MCP server for AgentCore Gateway WebSearch ([中文](agentcore-search-mcp/README_ZH.md), [agent install steps](agentcore-search-mcp/INSTALL_FOR_AGENTS.md)) |
 
 ## Security
 
@@ -467,3 +509,7 @@ Contributions are welcome! Please fork, create a feature branch, add tests, and 
 ## License
 
 MIT-0
+
+---
+
+⭐ If this project is useful to you, please consider [starring the repo](https://github.com/aws-samples/sample-bedrock-api-proxy) — it helps others discover it.

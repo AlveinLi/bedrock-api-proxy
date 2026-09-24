@@ -96,7 +96,12 @@
     "newKeysThisWeek": "new this week",
     "totalModels": "Total Models",
     "activeModels": "active",
-    "totalTokenUsage": "Total Token Usage"
+    "totalTokenUsage": "Total Token Usage",
+    "dailyUsage": "Daily Usage",
+    "cost": "Cost",
+    "tokens": "Tokens",
+    "lastNDays": "Last {{count}} days",
+    "dailyUsageError": "Failed to load daily usage"
   },
   "apiKeys": {
     "title": "User & API Key Management",
@@ -138,6 +143,11 @@
     "revokeKey": "Revoke Key",
     "reactivate": "Reactivate",
     "deletePermanently": "Delete Permanently",
+    "hoverChart": {
+      "costTitle": "Cost — Last 7 Days",
+      "tokensTitle": "Tokens — Last 7 Days",
+      "noData": "No usage in the last 7 days"
+    },
     "form": {
       "createTitle": "Create New API Key",
       "editTitle": "Edit API Key",
@@ -234,7 +244,15 @@
     "confirmDelete": "Are you sure you want to delete this model pricing?",
     "pricingCreated": "Model pricing created successfully",
     "pricingUpdated": "Model pricing updated successfully",
-    "pricingDeleted": "Model pricing deleted successfully"
+    "pricingDeleted": "Model pricing deleted successfully",
+    "syncNow": "Sync from LiteLLM",
+    "syncing": "Syncing...",
+    "syncTooltip": "Pull latest model pricing from the LiteLLM price table",
+    "confirmSync": "Sync model pricing from the LiteLLM price table? Rows created by the sync will be updated; manually created or edited rows are left untouched.",
+    "syncCompleted": "Pricing sync completed",
+    "syncSummary": "{{sourceModels}} source models: {{created}} created, {{updated}} updated, {{unchanged}} unchanged.",
+    "syncSkippedManual": "{{count}} manually managed rows were skipped.",
+    "syncFailed": "Pricing sync failed"
   },
   "modelMapping": {
     "title": "Model Mapping",
@@ -245,7 +263,7 @@
     "bedrockModelId": "Bedrock Model ID",
     "source": "Source",
     "sources": {
-      "default": "Default",
+      "default": "Default (remote)",
       "custom": "Custom",
       "override": "Overridden"
     },
@@ -265,7 +283,38 @@
     "mappingDeleted": "Model mapping deleted successfully",
     "defaultValue": "Default",
     "restoreDefault": "Restore Default",
-    "confirmRestoreDefault": "Remove this override and restore the default mapping?"
+    "confirmRestoreDefault": "Remove this override and restore the default mapping?",
+    "sync": {
+      "syncNow": "Refresh defaults",
+      "syncing": "Refreshing...",
+      "tooltip": "Pull the latest default mappings from the remote model_mappings.json",
+      "disabledTooltip": "Remote sync is disabled (MODEL_MAPPING_SYNC_ENABLED=False)",
+      "completed": "Default mappings refreshed",
+      "summary": "{{remote}} remote mappings, {{active}} active: {{added}} added, {{removed}} removed, {{changed}} changed.",
+      "localOverrides": "{{count}} entries from DEFAULT_MODEL_MAPPING are layered on top of the remote file.",
+      "failed": "Refresh failed — the previous default mappings are still in effect",
+      "lastError": "last refresh failed: {{error}}",
+      "sourceLabel": {
+        "remote": "{{count}} default mappings from the remote file",
+        "bundled": "{{count}} default mappings from the local snapshot (remote not fetched yet)",
+        "env": "{{count}} default mappings from DEFAULT_MODEL_MAPPING + local snapshot"
+      }
+    },
+    "speed": {
+      "column": "Speed",
+      "test": "Test",
+      "testing": "Testing...",
+      "never": "Not tested",
+      "ttft": "TTFT",
+      "otps": "Output speed",
+      "tokens": "Output tokens",
+      "hiddenReasoningTokens": "Hidden reasoning tokens (excluded from speed)",
+      "reasoning": "reasoning",
+      "failed": "Failed",
+      "hoverTitle": "Last 10 speed tests",
+      "noData": "No data",
+      "misconfigured": "PROXY_BASE_URL or the internal API key is not configured. Check the admin backend configuration."
+    }
   },
   "betaHeaders": {
     "title": "Beta Headers",

@@ -38,6 +38,11 @@ from admin_portal.backend.api import provider_keys, providers, routing, failover
 from admin_portal.backend.api import usage_stats, content_audit, content_audit_history
 from admin_portal.backend.middleware.cognito_auth import CognitoAuthMiddleware
 from admin_portal.backend.services.usage_aggregator import start_aggregator, stop_aggregator
+from admin_portal.backend.services.pricing_sync import start_pricing_sync, stop_pricing_sync
+from app.services.model_mapping_sync_service import (
+    start_model_mapping_sync,
+    stop_model_mapping_sync,
+)
 
 # Configuration
 ADMIN_PORT = 8005
@@ -69,9 +74,18 @@ async def lifespan(app: FastAPI):
     # Start usage aggregator background task
     start_aggregator(interval_seconds=USAGE_AGGREGATION_INTERVAL)
 
+    # Start periodic pricing sync (no-op unless PRICING_SYNC_ENABLED=True)
+    start_pricing_sync()
+
+    # Load default model mappings from the remote file + periodic refresh
+    # (no-op when MODEL_MAPPING_SYNC_ENABLED=False)
+    await start_model_mapping_sync()
+
     yield
 
-    # Stop usage aggregator
+    # Stop background tasks
+    stop_model_mapping_sync()
+    stop_pricing_sync()
     stop_aggregator()
     print("Admin Portal shutting down...")
 

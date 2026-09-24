@@ -132,6 +132,56 @@ class ToolReferenceContent(BaseModel):
     tool_name: str
 
 
+class ToolChangeToolReference(BaseModel):
+    """Reference to a tool declared in the request's `tools` array
+    (mid-conversation tool changes)."""
+
+    type: Literal["tool_reference"] = "tool_reference"
+    name: str
+
+
+class ToolChangeMcpToolReference(BaseModel):
+    """Reference to a single tool on an MCP server (mid-conversation tool changes)."""
+
+    type: Literal["mcp_tool_reference"] = "mcp_tool_reference"
+    server_name: str
+    name: str
+
+
+class ToolChangeMcpToolsetReference(BaseModel):
+    """Reference to an entire MCP toolset (mid-conversation tool changes)."""
+
+    type: Literal["mcp_toolset_reference"] = "mcp_toolset_reference"
+    server_name: str
+
+
+ToolChangeReference = Union[
+    ToolChangeToolReference,
+    ToolChangeMcpToolReference,
+    ToolChangeMcpToolsetReference,
+]
+
+
+class ToolAdditionContent(BaseModel):
+    """Offer a tool to the model from this point in the conversation onward
+    (beta: mid-conversation-tool-changes-2026-07-01). Only valid inside a
+    `role: "system"` message."""
+
+    type: Literal["tool_addition"] = "tool_addition"
+    tool: ToolChangeReference
+    cache_control: Optional["CacheControl"] = None
+
+
+class ToolRemovalContent(BaseModel):
+    """Withdraw a tool from this point in the conversation onward
+    (beta: mid-conversation-tool-changes-2026-07-01). Only valid inside a
+    `role: "system"` message."""
+
+    type: Literal["tool_removal"] = "tool_removal"
+    tool: ToolChangeReference
+    cache_control: Optional["CacheControl"] = None
+
+
 class CallerInfo(BaseModel):
     """Information about who invoked a tool (for PTC)."""
 
@@ -290,6 +340,9 @@ ContentBlock = Union[
     WebSearchToolResultContent,
     # Web fetch result types
     WebFetchToolResultContent,
+    # Mid-conversation tool changes (system-role messages)
+    ToolAdditionContent,
+    ToolRemovalContent,
 ]
 
 
@@ -472,6 +525,11 @@ class Usage(BaseModel):
     output_tokens: int
     cache_creation_input_tokens: Optional[int] = None
     cache_read_input_tokens: Optional[int] = None
+    # Proxy extension (not in the Anthropic API): reasoning tokens that the
+    # upstream already counted in ``output_tokens`` but did not stream as
+    # content (OpenAI-compat models such as gpt-5.x on Bedrock Mantle).
+    # None when the upstream does not report a breakdown.
+    reasoning_tokens: Optional[int] = None
     iterations: Optional[List[Dict[str, Any]]] = None
     server_tool_use: Optional[Dict[str, Any]] = None  # e.g., {"web_search_requests": 3}
 
