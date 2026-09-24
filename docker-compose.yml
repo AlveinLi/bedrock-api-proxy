@@ -29,6 +29,17 @@ services:
       # DynamoDB (use local if running localstack)
       - DYNAMODB_ENDPOINT_URL=http://dynamodb-local:8000
 
+      # MySQL persistence (usage detail, content audit, API key store)
+      - MYSQL_ENABLED=${MYSQL_ENABLED:-True}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=${MYSQL_USER:-proxy}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-proxy_password}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-anthropic_proxy}
+
+      # Timezone for day/month boundaries and default display tz
+      - APP_TIMEZONE=${APP_TIMEZONE:-Asia/Shanghai}
+
       # Authentication
       - REQUIRE_API_KEY=True
       - MASTER_API_KEY=${MASTER_API_KEY:-sk-dev-master-key}
@@ -45,6 +56,7 @@ services:
 
     depends_on:
       - dynamodb-local
+      - mysql
 
     networks:
       - proxy-network
@@ -70,6 +82,32 @@ services:
     networks:
       - proxy-network
     restart: unless-stopped
+
+  # MySQL for persistence (usage detail, content audit, API key store)
+  mysql:
+    image: mysql:8.0
+    container_name: anthropic-proxy-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-root_password}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-anthropic_proxy}
+      - MYSQL_USER=${MYSQL_USER:-proxy}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-proxy_password}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - proxy-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD:-root_password}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   # DynamoDB Admin UI (optional)
   dynamodb-admin:
@@ -127,5 +165,6 @@ networks:
 
 volumes:
   dynamodb-data:
+  mysql-data:
   prometheus-data:
   grafana-data:

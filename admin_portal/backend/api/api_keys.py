@@ -2,7 +2,7 @@
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
@@ -20,10 +20,15 @@ from admin_portal.backend.schemas.api_key import (
     ApiKeyUpdate,
     ApiKeyResponse,
     ApiKeyListResponse,
+    api_key_store,
 )
 from admin_portal.backend.schemas.dashboard import DailyUsageResponse
 
 router = APIRouter()
+
+# DynamoDB applies a scan's Limit before FilterExpression, so a single scan page
+# can return fewer rows than requested. Scan in pages until `limit` is satisfied.
+_SCAN_PAGE_SIZE = 100
 
 
 def get_managers():
@@ -34,7 +39,7 @@ def get_managers():
 
 @router.get("", response_model=ApiKeyListResponse)
 async def list_api_keys(
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=1000, ge=1, le=5000),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     search: Optional[str] = Query(default=None),
 ):
@@ -42,18 +47,26 @@ async def list_api_keys(
     List all API keys with pagination and filtering.
 
     Args:
-        limit: Maximum number of items to return (1-100)
+        limit: Maximum number of items to return (1-5000)
         status_filter: Filter by status ('active', 'revoked', or None for all)
         search: Search term for filtering by name or key prefix
     """
     api_key_manager, _, usage_stats_manager = get_managers()
 
-    result = api_key_manager.list_all_api_keys(
-        limit=limit,
-        status_filter=status_filter,
-    )
+    items: List[Dict[str, Any]] = []
+    last_key: Optional[Dict[str, Any]] = None
+    while len(items) < limit:
+        result = api_key_manager.list_all_api_keys(
+            limit=_SCAN_PAGE_SIZE,
+            last_key=last_key,
+            status_filter=status_filter,
+        )
+        items.extend(result.get("items", []))
+        last_key = result.get("last_key")
+        if not last_key:
+            break
 
-    items = result.get("items", [])
+    items = items[:limit]
 
     # Apply search filter if provided
     if search:
@@ -67,8 +80,11 @@ async def list_api_keys(
         ]
 
     # Add usage stats to each item
+    stats_by_key = usage_stats_manager.get_stats_batch(
+        [item.get("api_key", "") for item in items]
+    )
     for item in items:
-        stats = usage_stats_manager.get_stats(item.get("api_key", ""))
+        stats = stats_by_key.get(item.get("api_key", ""))
         if stats:
             item["total_input_tokens"] = int(stats.get("total_input_tokens", 0))
             item["total_output_tokens"] = int(stats.get("total_output_tokens", 0))
@@ -85,8 +101,26 @@ async def list_api_keys(
     return ApiKeyListResponse(
         items=[ApiKeyResponse(**item) for item in items],
         count=len(items),
-        last_key=result.get("last_key"),
+        last_key=last_key,
     )
+
+
+@router.post("/sync-to-dynamo")
+async def sync_keys_to_dynamo():
+    """
+    Overwrite DynamoDB with all API key records from the MySQL master store.
+
+    Useful for system initialization or to force DynamoDB back in line with
+    MySQL. Requires MySQL to be enabled.
+    """
+    api_key_manager, _, _ = get_managers()
+    result = api_key_store.sync_all_to_dynamo(api_key_manager)
+    if result.get("error"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result["error"],
+        )
+    return result
 
 
 @router.get("/{api_key}", response_model=ApiKeyResponse)
@@ -141,15 +175,19 @@ async def create_api_key(request: ApiKeyCreate):
                 detail=f"Provider '{request.provider_id}' is inactive",
             )
 
-    new_key = api_key_manager.create_api_key(
+    new_key = api_key_store.create_api_key(
+        api_key_manager,
         user_id=request.user_id,
         name=request.name,
         owner_name=request.owner_name,
         role=request.role,
         monthly_budget=request.monthly_budget,
+        daily_token_limit=request.daily_token_limit,
         rate_limit=request.rate_limit,
         service_tier=request.service_tier,
         cache_ttl=request.cache_ttl,
+        routing_strategy=request.routing_strategy,
+        compression_strategy=request.compression_strategy,
         provider_id=request.provider_id,
     )
 
@@ -177,10 +215,10 @@ async def update_api_key(api_key: str, request: ApiKeyUpdate):
             detail="API key not found",
         )
 
-    # Update the key
+    # Update the key (MySQL first, then DynamoDB)
     update_data = request.model_dump(exclude_none=True)
     if update_data:
-        success = api_key_manager.update_api_key(api_key, **update_data)
+        success = api_key_store.update_api_key(api_key_manager, api_key, update_data)
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -202,9 +240,26 @@ async def update_api_key(api_key: str, request: ApiKeyUpdate):
         current_mtd = float(item.get("budget_used_mtd", 0) or 0)
 
         if new_budget > 0 and current_mtd >= new_budget:
-            # Deactivate the key for budget exceeded
-            api_key_manager.deactivate_for_budget_exceeded(api_key)
+            # Deactivate the key for budget exceeded (MySQL + DynamoDB)
+            api_key_store.set_active(
+                api_key_manager, api_key, is_active=False, reason="budget_exceeded"
+            )
             # Refresh the item to get updated status
+            item = api_key_manager.get_api_key(api_key)
+            if not item:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to retrieve API key after deactivation",
+                )
+
+    # Check if the daily token limit was lowered below today's usage
+    if request.daily_token_limit is not None and item.get("is_active", False):
+        new_daily_wan = float(request.daily_token_limit)
+        daily_used = int(item.get("daily_tokens_used", 0) or 0)
+        if new_daily_wan > 0 and daily_used >= new_daily_wan * 10000:
+            api_key_store.set_active(
+                api_key_manager, api_key, is_active=False, reason="daily_token_exceeded"
+            )
             item = api_key_manager.get_api_key(api_key)
             if not item:
                 raise HTTPException(
@@ -233,7 +288,7 @@ async def deactivate_api_key(api_key: str):
             detail="API key not found",
         )
 
-    api_key_manager.deactivate_api_key(api_key)
+    api_key_store.set_active(api_key_manager, api_key, is_active=False)
     return {"message": "API key deactivated successfully"}
 
 
@@ -255,7 +310,7 @@ async def reactivate_api_key(api_key: str):
             detail="API key not found",
         )
 
-    success = api_key_manager.reactivate_api_key(api_key)
+    success = api_key_store.set_active(api_key_manager, api_key, is_active=True)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -285,7 +340,7 @@ async def delete_api_key_permanently(api_key: str):
             detail="API key not found",
         )
 
-    success = api_key_manager.delete_api_key(api_key)
+    success = api_key_store.delete_api_key(api_key_manager, api_key)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

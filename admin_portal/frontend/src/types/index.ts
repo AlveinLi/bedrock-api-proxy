@@ -7,3 +7,5 @@ export * from './routing';
 export * from './failover';
 export * from './provider';
 export * from './betaHeaders';
+export * from './usage-stats';
+export * from './content-audit';

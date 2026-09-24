@@ -9,6 +9,9 @@ export interface ApiKey {
   budget_used_mtd?: number;  // Month-to-date budget used (resets monthly)
   budget_mtd_month?: string;  // Month for MTD tracking (YYYY-MM format)
   budget_history?: string;  // Monthly budget history as JSON string (e.g., {"2025-11": 32.11})
+  daily_token_limit?: number;  // Daily token limit in units of 10k tokens; 0 = unlimited
+  daily_tokens_used?: number;  // Raw tokens consumed for the current local day
+  daily_tokens_date?: string;  // Local day key (YYYY-MM-DD)
   tpm_limit?: number;
   rate_limit?: number;
   service_tier?: string;
@@ -34,6 +37,7 @@ export interface ApiKeyCreate {
   owner_name?: string;
   role?: string;
   monthly_budget?: number;
+  daily_token_limit?: number;  // Units of 10k tokens; 0 = unlimited
   rate_limit?: number;
   service_tier?: string;
   cache_ttl?: string | null;
@@ -47,6 +51,7 @@ export interface ApiKeyUpdate {
   owner_name?: string;
   role?: string;
   monthly_budget?: number;
+  daily_token_limit?: number;  // Units of 10k tokens; 0 = unlimited
   rate_limit?: number;
   service_tier?: string;
   is_active?: boolean;

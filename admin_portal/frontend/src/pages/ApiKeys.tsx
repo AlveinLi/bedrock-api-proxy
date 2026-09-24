@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   useApiKeys,
@@ -9,10 +9,15 @@ import {
   useDeleteApiKey,
   useDashboardStats,
   useProviders,
+  useSyncKeysToDynamo,
 } from '../hooks';
 import type { ApiKey, ApiKeyCreate, ApiKeyUpdate } from '../types';
 import { formatTokens, cacheHitRate, formatCacheHitRate } from '../utils';
 import UsageHoverChart from '../components/UsageHoverChart';
+
+// Every key is fetched in one request so search and paging cover the full set
+const FETCH_LIMIT = 1000;
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
 
 // Modal Component
 function Modal({
@@ -71,6 +76,7 @@ function ApiKeyForm({
     // Use owner_name if set, otherwise fall back to user_id (same as list display)
     owner_name: initialData?.owner_name || initialData?.user_id || '',
     monthly_budget: initialData?.monthly_budget || 0,
+    daily_token_limit: initialData?.daily_token_limit || 0,
     rate_limit: initialData?.rate_limit || 1000,
     service_tier: initialData?.service_tier || 'default',
     cache_ttl: initialData?.cache_ttl || '',
@@ -159,6 +165,23 @@ function ApiKeyForm({
             className="w-full px-3 py-2 bg-input-bg border border-border-dark rounded-lg text-white focus:border-primary focus:ring-1 focus:ring-primary"
           />
         </div>
+      </div>
+
+      <div>
+        <label className="block text-sm font-medium text-slate-300 mb-1">
+          {t('apiKeys.form.dailyTokenLimit')}
+        </label>
+        <input
+          type="number"
+          step="0.1"
+          min="0"
+          value={formData.daily_token_limit}
+          onChange={(e) =>
+            setFormData({ ...formData, daily_token_limit: parseFloat(e.target.value) || 0 })
+          }
+          className="w-full px-3 py-2 bg-input-bg border border-border-dark rounded-lg text-white focus:border-primary focus:ring-1 focus:ring-primary"
+        />
+        <p className="mt-1 text-xs text-slate-500">{t('apiKeys.form.dailyTokenLimitDesc')}</p>
       </div>
 
       <div>
@@ -253,11 +276,35 @@ export default function ApiKeys() {
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editingKey, setEditingKey] = useState<ApiKey | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
 
   const { data, isLoading, error } = useApiKeys({
+    limit: FETCH_LIMIT,
     status: statusFilter || undefined,
-    search: search || undefined,
   });
+
+  // Search runs client-side so it covers every key, not just the visible page
+  const filteredKeys = useMemo(() => {
+    const items = data?.items || [];
+    const term = search.trim().toLowerCase();
+    if (!term) return items;
+    return items.filter((key) =>
+      [key.name, key.api_key, key.owner_name, key.user_id].some((field) =>
+        (field || '').toLowerCase().includes(term)
+      )
+    );
+  }, [data, search]);
+
+  const totalCount = filteredKeys.length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const pageStart = (currentPage - 1) * pageSize;
+  const pagedKeys = filteredKeys.slice(pageStart, pageStart + pageSize);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, statusFilter, pageSize]);
 
   const { data: stats } = useDashboardStats();
   const { data: providersData } = useProviders();
@@ -266,6 +313,17 @@ export default function ApiKeys() {
   const deactivateMutation = useDeactivateApiKey();
   const reactivateMutation = useReactivateApiKey();
   const deleteMutation = useDeleteApiKey();
+  const syncMutation = useSyncKeysToDynamo();
+
+  const handleSyncToDynamo = async () => {
+    if (!confirm(t('apiKeys.confirmSync'))) return;
+    try {
+      const result = await syncMutation.mutateAsync();
+      alert(t('apiKeys.syncResult', { synced: result.synced, failed: result.failed }));
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  };
 
   const handleCreate = async (data: ApiKeyCreate | ApiKeyUpdate) => {
     await createMutation.mutateAsync(data as ApiKeyCreate);
@@ -296,13 +354,13 @@ export default function ApiKeys() {
   };
 
   const handleExport = useCallback(() => {
-    const apiKeys = data?.items || [];
+    const apiKeys = filteredKeys;
     if (apiKeys.length === 0) {
       alert('No data to export');
       return;
     }
 
-    const headers = ['API Key', 'Name', 'Owner', 'User ID', 'Status', 'Monthly Budget', 'Budget Used (MTD)', 'Budget Used (Total)', 'Rate Limit', 'Service Tier', 'Cache TTL', 'Created At', 'Total Requests', 'Total Input Tokens', 'Total Output Tokens', 'Total Cached Tokens', 'Total Cache Write Tokens', 'Cache Hit Rate (%)'];
+    const headers = ['API Key', 'Name', 'Owner', 'User ID', 'Status', 'Monthly Budget', 'Budget Used (MTD)', 'Budget Used (Total)', 'Daily Token Limit (10K)', 'Daily Tokens Used', 'Rate Limit', 'Service Tier', 'Cache TTL', 'Created At', 'Total Requests', 'Total Input Tokens', 'Total Output Tokens', 'Total Cached Tokens', 'Total Cache Write Tokens', 'Cache Hit Rate (%)'];
 
     const rows = apiKeys.map((key) => {
       const hitRate = cacheHitRate(
@@ -319,6 +377,8 @@ export default function ApiKeys() {
         key.monthly_budget || 0,
         key.budget_used_mtd || 0,
         key.budget_used || 0,
+        key.daily_token_limit || 0,
+        key.daily_tokens_used || 0,
         key.rate_limit || 0,
         key.service_tier || 'default',
         key.cache_ttl || 'default',
@@ -356,7 +416,7 @@ export default function ApiKeys() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-  }, [data]);
+  }, [filteredKeys]);
 
   const copyToClipboard = useCallback(async (text: string) => {
     try {
@@ -461,6 +521,15 @@ export default function ApiKeys() {
           >
             <span className="material-symbols-outlined text-[20px]">file_download</span>
             {t('apiKeys.export')}
+          </button>
+          <button
+            onClick={handleSyncToDynamo}
+            disabled={syncMutation.isPending}
+            className="flex items-center justify-center gap-2 h-10 px-4 rounded-lg bg-surface-dark border border-border-dark text-white text-sm font-medium hover:bg-border-dark transition-colors disabled:opacity-50"
+            title={t('apiKeys.syncToDynamoDesc')}
+          >
+            <span className={`material-symbols-outlined text-[20px] ${syncMutation.isPending ? 'animate-spin' : ''}`}>sync</span>
+            {t('apiKeys.syncToDynamo')}
           </button>
           <button
             onClick={() => setShowCreateModal(true)}
@@ -601,6 +670,9 @@ export default function ApiKeys() {
                   {t('apiKeys.monthlyBudget')}
                 </th>
                 <th className="px-6 py-4 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                  {t('apiKeys.dailyTokenLimit')}
+                </th>
+                <th className="px-6 py-4 text-xs font-semibold text-slate-400 uppercase tracking-wider">
                   {t('apiKeys.lastMonth')}
                 </th>
                 <th className="px-6 py-4 text-xs font-semibold text-slate-400 uppercase tracking-wider">
@@ -626,20 +698,20 @@ export default function ApiKeys() {
             <tbody className="divide-y divide-border-dark">
               {isLoading ? (
                 <tr>
-                  <td colSpan={11} className="px-6 py-12 text-center">
+                  <td colSpan={12} className="px-6 py-12 text-center">
                     <span className="material-symbols-outlined animate-spin text-4xl text-primary">
                       progress_activity
                     </span>
                   </td>
                 </tr>
-              ) : data?.items.length === 0 ? (
+              ) : totalCount === 0 ? (
                 <tr>
-                  <td colSpan={11} className="px-6 py-12 text-center text-slate-400">
+                  <td colSpan={12} className="px-6 py-12 text-center text-slate-400">
                     No API keys found
                   </td>
                 </tr>
               ) : (
-                data?.items.map((key) => {
+                pagedKeys.map((key) => {
                   // Use budget_used_mtd for comparison with monthly_budget
                   const mtdBudget = key.budget_used_mtd ?? key.budget_used ?? 0;
                   const usedPercent = key.monthly_budget
@@ -797,6 +869,32 @@ export default function ApiKeys() {
                           </div>
                         </UsageHoverChart>
                       </td>
+                      <td className="px-6 py-4 whitespace-nowrap align-middle">
+                        {(() => {
+                          const limitWan = key.daily_token_limit || 0;
+                          const usedTokens = key.daily_tokens_used || 0;
+                          if (limitWan <= 0) {
+                            return <span className="text-xs text-slate-500">{t('apiKeys.unlimited')}</span>;
+                          }
+                          const limitTokens = limitWan * 10000;
+                          const pct = Math.round((usedTokens / limitTokens) * 100);
+                          return (
+                            <div className="w-full flex flex-col gap-1.5 min-w-[120px]">
+                              <div className="flex justify-between text-xs">
+                                <span className="text-white font-medium">{formatTokens(usedTokens)}</span>
+                                <span className="text-slate-500">/ {formatTokens(limitTokens)}</span>
+                              </div>
+                              <div className="w-full bg-border-dark h-2 rounded-full overflow-hidden">
+                                <div
+                                  className={`h-full rounded-full ${pct >= 100 ? 'bg-red-500' : pct > 75 ? 'bg-orange-500' : 'bg-primary'}`}
+                                  style={{ width: `${Math.min(pct, 100)}%` }}
+                                ></div>
+                              </div>
+                              <span className="text-[10px] text-slate-500">{pct}% {t('apiKeys.used')}</span>
+                            </div>
+                          );
+                        })()}
+                      </td>
                       <td className="px-6 py-4 whitespace-nowrap">
                         {(() => {
                           const lastMonthBudget = getLastMonthBudget(key.budget_history);
@@ -861,7 +959,7 @@ export default function ApiKeys() {
                           className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${
                             key.is_active
                               ? 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20'
-                              : key.deactivated_reason === 'budget_exceeded'
+                              : key.deactivated_reason === 'budget_exceeded' || key.deactivated_reason === 'daily_token_exceeded'
                               ? 'bg-red-500/10 text-red-400 border-red-500/20'
                               : 'bg-slate-100 dark:bg-border-dark text-slate-500 border-slate-200 dark:border-slate-700'
                           }`}
@@ -870,7 +968,7 @@ export default function ApiKeys() {
                             className={`size-1.5 rounded-full ${
                               key.is_active
                                 ? 'bg-emerald-500'
-                                : key.deactivated_reason === 'budget_exceeded'
+                                : key.deactivated_reason === 'budget_exceeded' || key.deactivated_reason === 'daily_token_exceeded'
                                 ? 'bg-red-400'
                                 : 'bg-slate-500'
                             }`}
@@ -879,6 +977,8 @@ export default function ApiKeys() {
                             ? t('common.active')
                             : key.deactivated_reason === 'budget_exceeded'
                             ? t('apiKeys.budgetExceeded')
+                            : key.deactivated_reason === 'daily_token_exceeded'
+                            ? t('apiKeys.dailyLimitExceeded')
                             : t('common.revoked')}
                         </span>
                       </td>
@@ -932,18 +1032,43 @@ export default function ApiKeys() {
         </div>
 
         {/* Pagination */}
-        <div className="flex items-center justify-between px-6 py-4 border-t border-border-dark bg-[#151b28]">
-          <span className="text-sm text-slate-400">
-            {t('common.showing')} 1 {t('common.of')} {data?.count || 0} {t('common.entries')}
-          </span>
+        <div className="flex flex-col sm:flex-row items-center justify-between gap-3 px-6 py-4 border-t border-border-dark bg-[#151b28]">
+          <div className="flex items-center gap-4">
+            <span className="text-sm text-slate-400">
+              {t('common.showing')} {totalCount === 0 ? 0 : pageStart + 1}-
+              {pageStart + pagedKeys.length} {t('common.of')} {totalCount} {t('common.entries')}
+            </span>
+            <label className="flex items-center gap-2 text-sm text-slate-400">
+              {t('common.perPage')}
+              <select
+                value={pageSize}
+                onChange={(e) => setPageSize(Number(e.target.value))}
+                className="px-2 py-1 bg-transparent border border-border-dark rounded-lg text-slate-300 text-sm focus:border-primary focus:ring-0"
+              >
+                {PAGE_SIZE_OPTIONS.map((size) => (
+                  <option key={size} value={size}>
+                    {size}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
           <div className="flex items-center gap-2">
             <button
-              className="px-3 py-1 text-sm text-slate-400 hover:text-white disabled:opacity-50"
-              disabled
+              onClick={() => setPage(Math.max(1, currentPage - 1))}
+              disabled={currentPage <= 1}
+              className="px-3 py-1 text-sm text-slate-300 border border-border-dark rounded-lg hover:bg-border-dark disabled:opacity-40 disabled:hover:bg-transparent transition-colors"
             >
               {t('common.previous')}
             </button>
-            <button className="px-3 py-1 text-sm text-slate-400 hover:text-white">
+            <span className="text-sm text-slate-400">
+              {currentPage} / {totalPages}
+            </span>
+            <button
+              onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
+              disabled={currentPage >= totalPages}
+              className="px-3 py-1 text-sm text-slate-300 border border-border-dark rounded-lg hover:bg-border-dark disabled:opacity-40 disabled:hover:bg-transparent transition-colors"
+            >
               {t('common.next')}
             </button>
           </div>

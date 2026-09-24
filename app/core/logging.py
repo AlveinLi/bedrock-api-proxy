@@ -4,7 +4,9 @@ Structured logging configuration.
 Provides structured logging with context and correlation IDs for tracing.
 """
 import logging
+import os
 import sys
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict
 
 from app.core.config import settings
@@ -63,24 +65,59 @@ class StructuredFormatter(logging.Formatter):
 
 
 def setup_logging():
-    """Configure application logging."""
+    """Configure application logging.
+
+    Emits to stdout by default (collected by the ECS awslogs driver -> CloudWatch).
+    When ``LOG_TO_FILE=True`` a rotating local file handler is added (and stdout can
+    be disabled via ``LOG_TO_STDOUT=False``) so deployments can avoid CloudWatch.
+    """
     # Get log level from settings
     log_level = getattr(logging, settings.log_level.upper())
-
-    # Create handler
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(log_level)
 
     # Set formatter
     formatter = StructuredFormatter(
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    handler.setFormatter(formatter)
 
     # Configure root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
-    root_logger.addHandler(handler)
+
+    handlers: list[logging.Handler] = []
+
+    # stdout handler (default; primary path for CloudWatch via container logs)
+    if settings.log_to_stdout or not settings.log_to_file:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setLevel(log_level)
+        stream_handler.setFormatter(formatter)
+        handlers.append(stream_handler)
+
+    # Local rotating file handler (avoids depending on CloudWatch)
+    file_logging_error: str | None = None
+    if settings.log_to_file:
+        try:
+            log_dir = os.path.dirname(os.path.abspath(settings.log_file_path))
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            file_handler = RotatingFileHandler(
+                settings.log_file_path,
+                maxBytes=settings.log_file_max_bytes,
+                backupCount=settings.log_file_backup_count,
+                encoding="utf-8",
+            )
+            file_handler.setLevel(log_level)
+            file_handler.setFormatter(formatter)
+            handlers.append(file_handler)
+        except OSError as exc:  # pragma: no cover - fall back to stdout
+            file_logging_error = str(exc)
+            if not handlers:
+                stream_handler = logging.StreamHandler(sys.stdout)
+                stream_handler.setLevel(log_level)
+                stream_handler.setFormatter(formatter)
+                handlers.append(stream_handler)
+
+    for handler in handlers:
+        root_logger.addHandler(handler)
 
     # Configure specific loggers
     logging.getLogger("uvicorn").setLevel(logging.INFO)
@@ -91,8 +128,13 @@ def setup_logging():
     # Log startup message
     logger = logging.getLogger(__name__)
     logger.info(
-        f"Logging configured: level={settings.log_level}, environment={settings.environment}"
+        f"Logging configured: level={settings.log_level}, environment={settings.environment}, "
+        f"to_file={settings.log_to_file}, to_stdout={settings.log_to_stdout}"
     )
+    if file_logging_error:
+        logger.error(
+            f"Failed to initialize file logging at {settings.log_file_path}: {file_logging_error}"
+        )
 
 
 def get_logger(name: str) -> logging.Logger:

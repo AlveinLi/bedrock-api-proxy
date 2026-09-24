@@ -17,6 +17,9 @@ export default function Sidebar() {
   const navItems: NavItem[] = [
     { path: '/dashboard', icon: 'dashboard', label: t('nav.dashboard'), section: 'main' },
     { path: '/api-keys', icon: 'vpn_key', label: t('nav.apiKeys'), section: 'main' },
+    { path: '/usage-stats', icon: 'monitoring', label: t('nav.usageStats'), section: 'main' },
+    { path: '/content-audit', icon: 'fact_check', label: t('nav.contentAudit'), section: 'main' },
+    { path: '/content-audit-history', icon: 'inventory_2', label: t('nav.contentAuditHistory'), section: 'main' },
     { path: '/pricing', icon: 'payments', label: t('nav.pricing'), section: 'config' },
     { path: '/model-mapping', icon: 'swap_horiz', label: t('nav.modelMapping'), section: 'config' },
     { path: '/providers', icon: 'cloud', label: t('nav.providers'), section: 'config' },

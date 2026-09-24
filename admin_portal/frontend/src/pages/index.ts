@@ -4,3 +4,6 @@ export { default as ApiKeys } from './ApiKeys';
 export { default as Pricing } from './Pricing';
 export { default as ModelMapping } from './ModelMapping';
 export { default as BetaHeaders } from './BetaHeaders';
+export { default as UsageStats } from './UsageStats';
+export { default as ContentAudit } from './ContentAudit';
+export { default as ContentAuditHistory } from './ContentAuditHistory';

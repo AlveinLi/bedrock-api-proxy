@@ -49,6 +49,9 @@ dependencies = [
     "tavily-python>=0.5.0",
     # Encryption (for Provider Key encryption)
     "cryptography>=46.0.5",
+    # MySQL persistence (usage detail, content audit, API key master store)
+    "SQLAlchemy>=2.0.0",
+    "PyMySQL>=1.1.0",
 ]
 
 [project.optional-dependencies]
